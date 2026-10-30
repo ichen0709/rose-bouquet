@@ -1,0 +1,1783 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>玫瑰花束</title>
+<meta name="description" content="用 Three.js 做的 3D 玫瑰花束：拖曳旋轉、滾輪或雙指縮放，可切換花色與包裝風格。">
+<meta property="og:type" content="website">
+<meta property="og:title" content="玫瑰花束">
+<meta property="og:description" content="用 Three.js 做的 3D 玫瑰花束，可旋轉、縮放，並切換花色與包裝風格。">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ctext y='.9em' font-size='90'%3E%F0%9F%8C%B9%3C/text%3E%3C/svg%3E">
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; }
+  body { background: radial-gradient(ellipse at 50% 35%, #f6f0ec 0%, #e3d9d3 60%, #cfc3bc 100%); }
+  canvas { display: block; touch-action: none; }
+  #colors { position: fixed; right: 12px; top: 12px; z-index: 2; display: flex; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+  #colors button {
+    font: 13px system-ui, sans-serif; padding: 7px 14px; border-radius: 999px; cursor: pointer;
+    border: 1px solid rgba(0, 0, 0, 0.15); background: rgba(255, 255, 255, 0.7); color: #4a3a36;
+  }
+  #colors button.active { background: #4a3a36; color: #fff; border-color: #4a3a36; }
+  #hud {
+    display: none;                                   /* debug info: shown only with ?debug=1 */
+    position: fixed; left: 10px; top: 8px; z-index: 2; white-space: pre; pointer-events: none;
+    font: 12px/1.5 ui-monospace, Consolas, monospace; color: rgba(70, 50, 45, 0.75);
+  }
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 12px; text-align: center;
+    font: 12px/1.4 system-ui, sans-serif; color: rgba(70, 50, 45, 0.5); pointer-events: none;
+  }
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div id="hud">生成中…</div>
+<div id="colors"></div>
+<div id="hint">拖曳旋轉 · 滾輪 / 雙指縮放</div>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* =====================================================================
+ *  可調參數
+ * ===================================================================== */
+const ROSE_COUNT = 20;      // 花朵數量（建議 15~25）
+const MESH_DETAIL = 28;     // 網格細分：最近幾朵玫瑰每片花瓣的縱向分段數（橫向約 0.86 倍）；遠處自動降到 60% / 35%
+const HIGH_ROSES = 6;       // 保留高細分的玫瑰數（離鏡頭最近的幾朵）
+const SHADOW_ROSES = 6;     // 投射陰影的玫瑰數（只有中間主要幾朵）
+const PETALS = 36;          // 每朵花瓣數上限（實際 86%~100%）
+const CORE_PETALS = 4;      // 最內層緊包成花心的片數
+const OPEN = 1.0;           // 全體開合倍率
+const GAP = 0.005;          // 相鄰花瓣間的微小間隙
+const KEY_INTENSITY = 1.75; // 主光強度
+const ENV_INTENSITY = 1.3;  // RoomEnvironment 環境光強度
+const TRANSMISSION = 0;     // 花瓣透光（0 = 關閉；設 0.1 左右會好看但明顯變慢）
+const BABYS_BREATH_SPRIGS = 90;  // 滿天星枝數（全部從花莖束長出，只分布在花朵之間與周圍）
+const FADE_MS = 350;             // 換色漸變時間（玫瑰與滿天星共用同一個進度）
+const EUCALYPTUS_STEMS = 16;     // 尤加利葉莖數
+const EDGE_BUDS = 5;             // 最下排額外的含苞小玫瑰朵數（4~6），從紙口邊緣探出
+const SIDE_SPRIGS = 30;          // 沿紙口邊緣向外上方延伸的滿天星枝數
+const PAPER_TEXT = 'You are my LOVE';   // 中層白紙上印的字
+const RIBBON_TEXT = 'Happy everyday';   // 緞帶上的淡字
+const PAPER_CREASE = 0.7;        // 皺褶強度（0 = 平滑，1 = 較皺；褶紋由頸部放射狀匯聚）
+const PAPER_RIM_RADIUS = 4.5;    // 紙口半徑（中層）= 花頂圓弧最大半徑 4.3 的 1.05 倍；內層 -0.47、外層 +0.47（約 0.95 倍 / 1.15 倍）
+const PAPER_TAIL = 0.20;         // 紙尾長度，占花束總高度的比例
+const PAPER_THICK = 0.03;        // 紙的厚度（約 1.5 毫米）
+const ROLL_SIZE = 0.18;          // 紙口翻邊（輕輕外捲一圈）的半徑
+const BOW_SIZE = 1.0;            // 蝴蝶結大小（1.0 約為頸部寬度的 1.45 倍）
+const RIBBON_WIDTH_RATIO = 0.5;  // 緞帶寬度 ÷ 蝴蝶結環高度
+// （緞帶已改為零厚度的雙面曲面，不再有厚度參數）
+
+// 包裝風格：inner/mid/outer 為三層紙顏色，tulle 為外層薄紗，ribbon 為緞帶；
+// outerOp/tulleOp/ribbonOp 為透明度（ribbonOp 只作用在環與尾巴，結與窄帶永遠不透明），
+// ribbonRough/ribbonSheen/ribbonSpec 為緞帶材質（緞面：粗糙度約 0.42、絲光 0.6、鏡面 0.6；深色緞帶再壓低；薄紗：0.6 / 0.3 / 0.5），
+// ruffle = 1 時中層紙口有荷葉邊，text = 中層是否印字（ink 為字色），bg = 印刷底圖亮度，border = 淺色細邊
+const WRAP_STYLES = {
+  '奶油牛皮': { inner: '#C9AE8A', mid: '#F4F1EA', outer: '#EADBB8', tulle: '#FFF5E4', ribbon: '#EDE5D5', ink: 'rgba(120,100,82,0.62)',
+                tulleOp: 0.45, outerOp: 1, ribbonOp: 1, ribbonRough: 0.3, ribbonSheen: 1, ribbonSpec: 0.85, sheer: 0, ruffle: 0, text: true, bg: 255, border: false },
+  '霧黑':     { inner: '#3D3C41', mid: '#1E1D22', outer: '#101013', tulle: '#2B2931', ribbon: '#C9A24A', ink: '',
+                tulleOp: 0.40, outerOp: 1, ribbonOp: 1, ribbonRough: 0.32, ribbonSheen: 0.85, ribbonSpec: 0.7, ribbonMetal: 0.2, sheer: 0, ruffle: 0, text: false, bg: 255, border: false },
+  '粉荷葉':   { inner: '#F2D3D6', mid: '#EAB9C2', outer: '#F8DDE2', tulle: '#FCE6EB', ribbon: '#F2A6B6', ink: '',
+                tulleOp: 0.40, outerOp: 0.55, ribbonOp: 0.78, ribbonRough: 0.55, ribbonSheen: 0.6, ribbonSpec: 0.4, sheer: 1, ruffle: 1, text: false, bg: 232, border: true },
+  '銀灰紫':   { inner: '#8F8A9E', mid: '#E9E6EF', outer: '#B9B3C7', tulle: '#CFCADB', ribbon: '#7A1F3D', ink: 'rgba(150,148,172,0.6)',
+                tulleOp: 0.28, outerOp: 0.5, ribbonOp: 1, ribbonRough: 0.3, ribbonSheen: 1, ribbonSpec: 0.85, sheer: 0, ruffle: 0, text: true, bg: 255, border: false },
+};
+
+// base 花瓣底部 / mid 主色 / rim 邊緣 / core 靠近花心的色調 / sheen 絲絨光澤 / coreDark 花心變暗程度（1 = 不變暗）
+// breath 滿天星配色（切換花色時 0.4 秒漸變）
+// roughness、env 可選：個別顏色覆寫材質粗糙度與環境光強度
+const PALETTES = {
+  '粉橘':   { base: '#8f2a22', mid: '#f0795a', rim: '#ffc8ae', core: '#b84a34', sheen: '#ffd9c8', coreDark: 0.65, breath: '#FBEDE4' },
+  '正紅':   { base: '#2b0207', mid: '#a30a1d', rim: '#e8505f', core: '#4a050c', sheen: '#ff8a96', coreDark: 0.6, breath: '#F8E6E9' },
+  '象牙杏': { base: '#D6AC84', mid: '#F0DCC0', rim: '#FAF0DF', core: '#E2BE98', sheen: '#FFF1DC', coreDark: 0.92, breath: '#FAF3E3' },
+  '粉藍':   { base: '#6F8FB6', mid: '#A9C4DE', rim: '#D6E4F2', core: '#7F9FC4', sheen: '#E6F0FB', coreDark: 0.85, breath: '#E4EEF7' },
+  '黑':     { base: '#17151C', mid: '#25232B', rim: '#3B3846', core: '#0F0E13', sheen: '#6A6485', coreDark: 0.85, breath: '#CFCADB',
+              roughness: 0.4, env: 1.9 },
+};
+
+const rnd = (a = 0, b = 1) => a + Math.random() * (b - a);
+const lerp = (a, b, t) => a + (b - a) * t;
+const clamp01 = (x) => Math.min(1, Math.max(0, x));
+const smooth = (a, b, x) => { const t = clamp01((x - a) / (b - a)); return t * t * (3 - 2 * t); };
+const GOLDEN = 137.508 * Math.PI / 180;
+const UP = new THREE.Vector3(0, 1, 0);
+const Y_ROOT = -0.36;       // height where every petal root converges (just above the calyx)
+
+/* ============ renderer / scene ============ */
+const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.05;
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+document.body.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(), 0.04).texture;
+
+const camera = new THREE.PerspectiveCamera(35, innerWidth / innerHeight, 0.5, 80);
+camera.position.set(1.5, 2.2, innerWidth / innerHeight < 1 ? 32 : 22);
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.target.set(0, -2.6, 0);
+controls.enableDamping = true;
+controls.minDistance = 5;
+controls.maxDistance = 45;
+controls.autoRotate = true;           // slow turntable
+controls.autoRotateSpeed = 0.7;
+controls.maxPolarAngle = Math.PI * 0.8;
+
+const key = new THREE.DirectionalLight(0xfff1e6, KEY_INTENSITY);
+key.position.set(6, 10, 7);
+key.castShadow = true;
+key.shadow.mapSize.set(4096, 4096);
+key.target.position.set(0, -3, 0);          // aim at the middle of the bouquet so the whole cone fits the shadow map
+scene.add(key.target);
+key.shadow.camera.left = -9.5; key.shadow.camera.right = 9.5;
+key.shadow.camera.top = 9.5; key.shadow.camera.bottom = -9.5;
+key.shadow.camera.near = 1; key.shadow.camera.far = 32;
+key.shadow.bias = -0.0005;
+key.shadow.normalBias = 0.02;
+key.shadow.radius = 14;
+scene.add(key);
+scene.add(new THREE.HemisphereLight(0xffffff, 0xd8c8c0, 0.6));
+const fill = new THREE.DirectionalLight(0xbcd2ff, 0.45);   // weak cool fill opposite the warm key
+fill.position.set(-8, 4, -5);
+scene.add(fill);
+
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), new THREE.ShadowMaterial({ opacity: 0.2 }));
+floor.rotation.x = -Math.PI / 2;
+floor.position.y = -7.2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+const bouquet = new THREE.Group();     // everything of the bouquet; swayed by the wind about the grip
+scene.add(bouquet);
+
+/* =====================================================================
+ *  單朵玫瑰：花瓣配方 + 網格（同一配方可在不同細分下重建，LOD 外觀一致）
+ * ===================================================================== */
+function widthProfile(u) {
+  // narrow claw at the base, widest in the upper-middle, tip closes to 0 as a half-ellipse
+  const body = 0.24 + 0.76 * smooth(0, 0.62, u);
+  const s = smooth(0.62, 1, u);
+  return body * Math.sqrt(Math.max(0, 1 - s * s));
+}
+
+function makeVeinTexture() {
+  const W = 256, H = 512;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const img = g.createImageData(W, H);
+  const f = [];
+  for (let n = 0; n < 6; n++) f.push({ k: rnd(18, 70), p: rnd(0, 6.28), a: rnd(0.4, 1) });
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const xs = x / W, ys = y / H;
+    let v = 0;
+    for (const o of f) v += o.a * Math.sin(xs * o.k + o.p + Math.sin(ys * 3 + o.p) * 0.8);
+    v = v / 6 * 0.5 + 0.5;
+    v = v * 0.75 + Math.random() * 0.08 + (1 - ys) * 0.1;
+    const b = Math.max(0, Math.min(255, v * 255));
+    const q = (y * W + x) * 4;
+    img.data[q] = img.data[q + 1] = img.data[q + 2] = b; img.data[q + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  const tex = new THREE.CanvasTexture(c);
+  tex.anisotropy = 4;
+  return tex;
+}
+
+// every random choice is made once here, so geometry rebuilt at another detail level looks identical
+function makeRoseRecipe(open, nPetals) {
+  const P = nPetals;
+  const roll = rnd(0, Math.PI * 2);
+  const cand = [P - 1, P - 2, P - 3].sort(() => Math.random() - 0.5);
+  const wideOnes = new Set([cand[0]]);
+  if (Math.random() < 0.6) wideOnes.add(cand[1]);
+
+  const petals = [];
+  for (let i = 0; i < P; i++) {
+    const t = i / (P - 1);
+    const te = clamp01((i - CORE_PETALS * 0.5) / (P - 1 - CORE_PETALS * 0.5));
+    const e = te * te * (3 - 2 * te);                    // eased opening 0 (tight) -> 1 (open)
+    const outerK = Math.max(0, i - (P - 4)) / 3;         // last three petals hang down
+    const wide = wideOnes.has(i) ? 1 : 0;
+    const sizeJ = rnd(0.9, 1.1), tiltJ = rnd(-8, 8) * Math.PI / 180, rollJ = rnd(-6, 6) * Math.PI / 180;
+    const bendJ = rnd(0.85, 1.15);
+    const L = (0.34 + 0.80 * Math.pow(t, 0.9)) * sizeJ * (1 - 0.15 * outerK);
+    const y0 = 0.18 - 0.55 * Math.pow(t, 0.9);
+    const yStart = Math.min(y0, Y_ROOT);
+    petals.push({
+      t, e, outerK, L,
+      root: y0 - yStart, yStart,                        // root extends the petal down to the calyx
+      hs: (1.85 - 1.0 * t) * rnd(0.95, 1.05),
+      alpha0: Math.max(0.02, (3 + 66 * Math.pow(e, 1.15) + 14 * outerK + 16 * wide) * Math.PI / 180 + tiltJ * (0.3 + e)),
+      curl: ((0.12 + 0.9 * e) + 0.8 * outerK) * open * bendJ,
+      lip: (0.35 + 2.0 * e + 0.5 * wide) * open * bendJ,
+      r0: 0.04 + 0.12 * Math.pow(t, 1.1) + GAP * i,
+      phi: i * GOLDEN + roll + rollJ,
+      spiralAmp: 0.04 * (1 - smooth(0, 0.6, t)),
+      rippleAmp: 0.02 + 0.045 * e + 0.02 * outerK,
+      asym: rnd(-0.12, 0.12) + (outerK > 0 ? rnd(-0.1, 0.1) : 0),
+      skew: rnd(-0.04, 0.04), twist: rnd(-0.22, 0.22),
+      waveF: rnd(2.0, 3.6), waveP: rnd(0, 6.28), waveF2: rnd(4.5, 6.5), waveP2: rnd(0, 6.28),
+      tint: rnd(0.96, 1.04), hue: rnd(-0.012, 0.012),
+    });
+  }
+  const sepalAz = rnd(0, 6.28);
+  return { petals, sepalAz };
+}
+
+const PROFILE_STEPS = 96;
+
+// attributes every merged part must share
+function addAttrs(g, { t = -3, color = null } = {}) {
+  const n = g.attributes.position.count;
+  const col = new Float32Array(n * 3);
+  if (color) for (let i = 0; i < n; i++) { col[i * 3] = color.r; col[i * 3 + 1] = color.g; col[i * 3 + 2] = color.b; }
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.setAttribute('colorB', new THREE.BufferAttribute(col.slice(), 3));   // fade target colour
+  g.setAttribute('aU', new THREE.BufferAttribute(new Float32Array(n), 1));
+  g.setAttribute('aV', new THREE.BufferAttribute(new Float32Array(n), 1));
+  g.setAttribute('aT', new THREE.BufferAttribute(new Float32Array(n).fill(t), 1));
+  g.setAttribute('aMisc', new THREE.BufferAttribute(new Float32Array(n * 2), 2));
+  return g;
+}
+
+function petalGeometry(p, NU, NV) {
+  const M = (NU + 1) * (NV + 1);
+  const id = (k, j) => k * (NV + 1) + j;
+  const Ltot = p.L + p.root;
+
+  // meridian profile over the whole length (root + visible petal); tilt grows smoothly from vertical at the root
+  const rr = new Float32Array(PROFILE_STEPS + 1), yy = new Float32Array(PROFILE_STEPS + 1);
+  rr[0] = p.r0; yy[0] = p.yStart;
+  for (let k = 1; k <= PROFILE_STEPS; k++) {
+    const s = (k - 0.5) / PROFILE_STEPS * Ltot;
+    const uL = clamp01((s - p.root) / p.L);
+    const lip = smooth(0.8, 1, uL);
+    const a = p.alpha0 * (p.root > 1e-4 ? smooth(0, p.root, s) : 1) + p.curl * Math.pow(uL, 1.5) + p.lip * lip * lip * (3 - 2 * lip);
+    rr[k] = rr[k - 1] + Math.sin(a) * Ltot / PROFILE_STEPS;
+    yy[k] = yy[k - 1] + Math.cos(a) * Ltot / PROFILE_STEPS;
+  }
+  const prof = (u) => {
+    const x = clamp01(u) * PROFILE_STEPS;
+    const k0 = Math.min(Math.floor(x), PROFILE_STEPS - 1), f = x - k0;
+    return [lerp(rr[k0], rr[k0 + 1], f), lerp(yy[k0], yy[k0 + 1], f)];
+  };
+
+  const pos = new Float32Array(M * 3);
+  const uA = new Float32Array(M), vA = new Float32Array(M), uv = new Float32Array(M * 4);
+  for (let k = 0; k <= NU; k++) {
+    const x = k / NU;
+    const up = 1 - Math.pow(1 - x, 1.5);               // denser rows toward the rolled tip
+    const s = up * Ltot;
+    const uL = clamp01((s - p.root) / p.L);
+    const wf = Math.max(0.0015, s < p.root ? lerp(0.1, 0.24, smooth(0, p.root, s)) : widthProfile(uL));
+    const amp = p.rippleAmp * uL * uL;
+    for (let j = 0; j <= NV; j++) {
+      const v = -1 + 2 * j / NV;
+      let [r, y] = prof(up);
+      const ripple = Math.sin(v * p.waveF * Math.PI + p.waveP) * 0.7 + Math.sin(v * p.waveF2 * Math.PI + p.waveP2) * 0.3;
+      r += 0.12 * p.L * v * v * uL * uL * (0.3 + p.e)
+        - 0.05 * (1 - smooth(0, 0.45, p.t)) * v * v * uL
+        + (0.5 + 0.5 * v) * p.spiralAmp * (0.4 + 0.6 * uL)
+        + amp * ripple
+        + p.twist * 0.08 * v * uL;
+      y += 0.05 * p.L * v * v * uL + amp * 0.7 * Math.sin(v * p.waveF * Math.PI + p.waveP + 1.3) + p.skew * v * uL * uL;
+      const psi = p.phi + v * p.hs * wf * (1 + p.asym * v) + p.twist * uL * uL * 0.35;
+      const q = id(k, j);
+      pos[q * 3] = r * Math.cos(psi); pos[q * 3 + 1] = y; pos[q * 3 + 2] = r * Math.sin(psi);
+      uA[q] = uL; vA[q] = Math.abs(v);
+      uv[q * 2] = v * 0.5 + 0.5; uv[q * 2 + 1] = up;
+      uv[(M + q) * 2] = v * 0.5 + 0.5; uv[(M + q) * 2 + 1] = up;
+    }
+  }
+
+  const tri = [];
+  for (let k = 0; k < NU; k++) for (let j = 0; j < NV; j++) {
+    const a = id(k, j), b = id(k + 1, j), c = id(k + 1, j + 1), d = id(k, j + 1);
+    tri.push(a, b, c, a, c, d);
+  }
+  const tmp = new THREE.BufferGeometry();
+  tmp.setAttribute('position', new THREE.BufferAttribute(pos.slice(0, M * 3), 3));
+  tmp.setIndex(tri);
+  tmp.computeVertexNormals();
+  const nrm = tmp.attributes.normal.array;
+  let sgn = 0;
+  for (let n = 0; n < M; n++) sgn += nrm[n * 3] * pos[n * 3] + nrm[n * 3 + 2] * pos[n * 3 + 2];
+  sgn = sgn >= 0 ? 1 : -1;
+  tmp.dispose();
+
+  const all = new Float32Array(M * 6);
+  all.set(pos, 0);
+  for (let q = 0; q < M; q++) {
+    const th = (0.004 + 0.013 * (1 - uA[q]) * (1 - vA[q] * vA[q])) * (0.7 + 0.5 * p.t) * sgn;   // thick base, thin rim
+    for (let c = 0; c < 3; c++) all[(M + q) * 3 + c] = pos[q * 3 + c] + nrm[q * 3 + c] * th;
+  }
+
+  const idx = [];
+  for (let n = 0; n < tri.length; n += 3) {
+    idx.push(tri[n], tri[n + 2], tri[n + 1]);
+    idx.push(M + tri[n], M + tri[n + 1], M + tri[n + 2]);
+  }
+  const strip = (a0, a1) => idx.push(a0, a1, M + a1, a0, M + a1, M + a0);
+  for (let k = 0; k < NU; k++) { strip(id(k, 0), id(k + 1, 0)); strip(id(k, NV), id(k + 1, NV)); }
+  for (let j = 0; j < NV; j++) strip(id(NU, j), id(NU, j + 1));
+
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(all, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  addAttrs(g, { t: p.t });
+  const aU = g.attributes.aU.array, aV = g.attributes.aV.array, aM = g.attributes.aMisc.array;
+  for (let q = 0; q < M; q++) {
+    for (const off of [0, M]) {
+      aU[q + off] = uA[q]; aV[q + off] = vA[q];
+      aM[(q + off) * 2] = p.tint; aM[(q + off) * 2 + 1] = p.hue;
+    }
+  }
+  return g;
+}
+
+const SEPAL_GREEN = new THREE.Color('#4a7a3c');
+const GREEN_DARK = new THREE.Color('#2d5428');
+
+// dark calyx cup under the petals: fills the hollow in the middle (coloured like the core, darker)
+function cupGeometry() {
+  const pts = [[0.001, -0.44], [0.10, -0.42], [0.20, -0.37], [0.30, -0.28], [0.36, -0.15], [0.38, 0.0], [0.37, 0.08]]
+    .map(([r, y]) => new THREE.Vector2(r, y));
+  return addAttrs(new THREE.LatheGeometry(pts, 28), { t: -2 });
+}
+
+// small receptacle hidden below the outermost petals
+function hipGeometry() {
+  const g = new THREE.SphereGeometry(0.13, 12, 8);
+  g.scale(1, 0.85, 1);
+  g.translate(0, -0.52, 0);
+  return addAttrs(g, { t: -3, color: GREEN_DARK });
+}
+
+// slender leaf-like sepal hugging the underside of the bloom, drooping outward and down
+function sepalGeometry(az) {
+  const nu = 10, nv = 4;
+  const pos = [], uv = [], idx = [];
+  const ex = [Math.cos(az), Math.sin(az)];
+  for (let k = 0; k <= nu; k++) {
+    const s = k / nu;
+    const r = 0.17 + 0.62 * s;
+    const y = -0.42 - 0.50 * s * s;
+    const w = 0.085 * Math.sin(Math.PI * Math.pow(s, 0.7));
+    for (let j = 0; j <= nv; j++) {
+      const a = -1 + 2 * j / nv;
+      const fold = Math.abs(a) * w * 0.6;
+      pos.push(ex[0] * r - ex[1] * a * w, y + fold, ex[1] * r + ex[0] * a * w);
+      uv.push(j / nv, s);
+    }
+  }
+  for (let k = 0; k < nu; k++) for (let j = 0; j < nv; j++) {
+    const a = k * (nv + 1) + j, b = (k + 1) * (nv + 1) + j, c = b + 1, d = a + 1;
+    idx.push(a, b, c, a, c, d);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return addAttrs(g, { t: -3, color: SEPAL_GREEN });
+}
+
+function buildRoseGeometry(recipe, NU, NV) {
+  const parts = recipe.petals.map(p => petalGeometry(p, NU, NV));
+  parts.push(cupGeometry(), hipGeometry());
+  for (let k = 0; k < 5; k++) parts.push(sepalGeometry(recipe.sepalAz + k * Math.PI * 2 / 5 + rnd(-0.12, 0.12)));
+  const g = mergeGeometries(parts, false);     // one geometry = one draw call per rose
+  parts.forEach(x => x.dispose());
+  return g;
+}
+
+/* ============ colouring: vertex colours act as soft AO (dark base / inside -> light rim) ============ */
+const cBase = new THREE.Color(), cMid = new THREE.Color(), cRim = new THREE.Color(), cCore = new THREE.Color(), cTmp = new THREE.Color();
+
+// writes the target colour (colorB); with `both` the shown colour (color) is set too
+function recolorGeometry(geo, pal, vr, both = false) {
+  const tone = (hex, c) => { c.set(hex); if (vr) c.offsetHSL(vr.dh, vr.ds, vr.dl); return c; };
+  tone(pal.base, cBase); tone(pal.mid, cMid); tone(pal.rim, cRim); tone(pal.core, cCore);
+  const A = geo.attributes;
+  const aU = A.aU.array, aV = A.aV.array, aT = A.aT.array, aM = A.aMisc.array, col = A.colorB.array, colA = A.color.array;
+  for (let q = 0, n = aT.length; q < n; q++) {
+    const t = aT[q];
+    if (t < -2.5) continue;                                   // sepals / receptacle keep their green
+    if (t < -1.5) {
+      cTmp.copy(cCore).multiplyScalar(0.5);                   // calyx cup: core colour, darker
+    } else {
+      const u = aU[q], va = aV[q];
+      cTmp.copy(cBase).lerp(cMid, smooth(0, 0.55, u)).lerp(cRim, smooth(0.6, 1, u) * (0.55 + 0.45 * va));
+      cTmp.lerp(cCore, 0.75 * Math.pow(1 - t, 1.3));
+      const dark = lerp(pal.coreDark, 1, Math.pow(t, 0.6));
+      const ao = lerp(0.82, 1, smooth(0, 0.65, u));
+      const vein = 0.97 + 0.03 * Math.cos((va * 9) / (0.35 + 0.65 * u) * Math.PI);
+      cTmp.multiplyScalar(dark * ao * vein * aM[q * 2] * (1 + 0.03 * Math.sin(q * 12.9898)));
+      cTmp.r *= 1 + aM[q * 2 + 1]; cTmp.b *= 1 - aM[q * 2 + 1];
+    }
+    col[q * 3] = cTmp.r; col[q * 3 + 1] = cTmp.g; col[q * 3 + 2] = cTmp.b;
+    if (both) { colA[q * 3] = cTmp.r; colA[q * 3 + 1] = cTmp.g; colA[q * 3 + 2] = cTmp.b; }
+  }
+  A.colorB.needsUpdate = true;
+  if (both) A.color.needsUpdate = true;
+}
+
+// freeze what is currently shown (mix m between color and colorB) as the new start colour
+function bakeGeometry(geo, m) {
+  const a = geo.attributes.color.array, b = geo.attributes.colorB.array;
+  for (let i = 0; i < a.length; i++) a[i] += (b[i] - a[i]) * m;
+  geo.attributes.color.needsUpdate = true;
+}
+
+/* ============ shared petal material ============ */
+const mixUniform = { value: 1 };   // 0 = old colour, 1 = new colour; driven by the single fade below
+const petalMaterial = new THREE.MeshPhysicalMaterial({
+  vertexColors: true,
+  side: THREE.DoubleSide,
+  roughness: 0.55,
+  metalness: 0,
+  sheen: 1,
+  sheenRoughness: 0.6,
+  sheenColor: new THREE.Color('#ffffff'),
+  transmission: TRANSMISSION,
+  thickness: 0.04,
+  ior: 1.35,
+  bumpMap: makeVeinTexture(),
+  bumpScale: 0.8,
+  envMapIntensity: ENV_INTENSITY,
+  polygonOffset: true,
+  polygonOffsetFactor: 1,
+  polygonOffsetUnits: 1,
+});
+petalMaterial.onBeforeCompile = (shader) => {
+  shader.uniforms.uMix = mixUniform;
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <common>', '#include <common>\nattribute vec3 colorB;\nuniform float uMix;')
+    .replace('#include <color_vertex>', 'vColor = mix(color, colorB, uMix);');
+};
+
+/* =====================================================================
+ *  花束
+ * ===================================================================== */
+let currentPal = PALETTES['粉橘'];
+const DOME_C = new THREE.Vector3(0, -3.2, 0);   // centre of the dome the blossoms sit on
+const DOME_R = 4.7;
+const TH_MAX = 0.98;                            // dome half-angle (rad)
+const GRIP = new THREE.Vector3(0, -5.4, 0);     // every stem converges here
+const detailOf = (level) => {
+  const nu = [MESH_DETAIL, Math.round(MESH_DETAIL * 0.6), Math.round(MESH_DETAIL * 0.35)][level];
+  const NU = Math.max(level === 2 ? 6 : 10, nu);
+  return [NU, Math.max(level === 2 ? 5 : 8, Math.round(NU * 0.86))];
+};
+
+class Rose {
+  constructor(spec) {
+    Object.assign(this, spec);
+    this.recipe = makeRoseRecipe(spec.open, spec.petals);
+    this.geos = [null, null, null];
+    this.level = -1;
+    this.mesh = new THREE.Mesh(undefined, petalMaterial);
+    this.mesh.position.copy(spec.origin);
+    this.mesh.quaternion.setFromUnitVectors(UP, spec.axis);
+    this.mesh.scale.setScalar(spec.scale);
+    this.mesh.castShadow = spec.index < SHADOW_ROSES;
+    this.mesh.receiveShadow = true;
+    bouquet.add(this.mesh);
+  }
+  setLevel(l) {
+    if (l === this.level) return;
+    if (!this.geos[l]) {
+      const [nu, nv] = detailOf(l);
+      this.geos[l] = buildRoseGeometry(this.recipe, nu, nv);
+      recolorGeometry(this.geos[l], currentPal, this.variant, true);
+    }
+    if (this.level === 0 && this.geos[0]) { this.geos[0].dispose(); this.geos[0] = null; }   // free the heavy mesh when it leaves the front
+    this.mesh.geometry = this.geos[l];
+    this.level = l;
+  }
+  // start a colour fade: the colour shown right now becomes the start, the new palette the target
+  retarget(m, instant) {
+    for (const g of this.geos) {
+      if (!g) continue;
+      if (instant) recolorGeometry(g, currentPal, this.variant, true);
+      else { bakeGeometry(g, m); recolorGeometry(g, currentPal, this.variant, false); }
+    }
+  }
+}
+
+/* =====================================================================
+ *  包裝紙的剖面（放在這裡，因為排花時要用它來確保最下排玫瑰不穿進紙壁）
+ *  座標：頸部（緞帶綁點）在 y = NECK_Y；h = 頸部以上的高度（紙尾為負）。花束的「後側」朝 -z，「前側」朝 +z，隨整束旋轉。
+ * ===================================================================== */
+const FLOWER_R = 4.3;                                           // radius of the blossom arc: the reference for the paper mouth
+const NECK_Y = -5.0;                                            // the ribbon ties the paper here
+const TOP_Y = 2.2;                                              // top of the blossoms
+const NECK_R = 0.72;                                            // radius of the gathered neck (mid layer)
+const TAIL_LEN = PAPER_TAIL * (TOP_Y - NECK_Y) / (1 - PAPER_TAIL);   // tail = PAPER_TAIL of the whole bouquet height
+const RIM_FRONT_Y = -0.8, RIM_BACK_Y = 0.3;                     // front rim: centre height of the lowest blossoms; back rim: middle of the dome
+const H_FRONT = RIM_FRONT_Y - NECK_Y, H_BACK = RIM_BACK_Y - NECK_Y;
+const RIM_GAP = 0.47;                                           // inner / outer rim radius = middle rim -/+ this (room for each layer's rolled edge)
+const HEIGHT_MID = 0, HEIGHT_INNER = -0.35, HEIGHT_OUTER = -1.6;   // the printed middle paper stands tallest, the outer one lowest
+const THETA_BACK = -Math.PI / 2;
+const wrapAngle = (a) => Math.atan2(Math.sin(a), Math.cos(a));
+const OUTER_N = 5, OUTER_HW = 52 * Math.PI / 180, OUTER_TH0 = 0.9;   // the outer paper sheets (the ribbon follows their pleats)
+
+function vnoise(x, y) {
+  const h = (a, b) => { const n = Math.sin(a * 127.1 + b * 311.7) * 43758.5453; return n - Math.floor(n); };
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const sx = fx * fx * (3 - 2 * fx), sy = fy * fy * (3 - 2 * fy);
+  return lerp(lerp(h(ix, iy), h(ix + 1, iy), sx), lerp(h(ix, iy + 1), h(ix + 1, iy + 1), sx), sy) * 2 - 1;
+}
+
+// tulip cup: a slim gathered neck, a belly, then an almost vertical wall at the rim (<= ~20 deg at the front, a few degrees at the back)
+function trumpetR(h) {
+  if (h < 0) { const t = clamp01(-h / TAIL_LEN); return NECK_R + 0.12 * t * t; }       // the tail flares slightly at its end
+  if (h >= H_FRONT) return PAPER_RIM_RADIUS + 0.06 * (h - H_FRONT);
+  const w = h / H_FRONT, S = w * w * (3 - 2 * w);
+  return NECK_R + (PAPER_RIM_RADIUS - NECK_R) * Math.pow(S, 0.75);
+}
+// layers keep their distance: 0.16 near the neck, RIM_GAP at the rim
+const layerOff = (sign, h) => sign * (0.16 + (RIM_GAP - 0.16) * smooth(0.25, 1, clamp01(h / H_FRONT)));
+// radial pleats: large at the neck, small at the rim, converging toward the neck because the phase depends on angle only
+const foldA = (h) => PAPER_CREASE * (0.14 * Math.exp(-Math.max(h, 0) / 1.6) + 0.035) * (h < 0 ? 0.8 : 1);
+const foldAt = (th, h) => foldA(h) * (0.7 * Math.sin(7 * th + 0.4) + 0.3 * Math.sin(15 * th + 1.1))
+  + PAPER_CREASE * 0.03 * vnoise(Math.cos(th) * 2 + h * 0.4, Math.sin(th) * 2 - h * 0.3);
+const lift = (u) => 0.08 * smooth(0.75, 1, u) - 0.03 * smooth(0.25, 0, u);      // shingled sheet edges
+// rim height around the circumference: tall at the back, low at the front, 2-3 gentle highs and lows on top
+const rimH = (th, ph) => lerp(H_FRONT, H_BACK, Math.pow(0.5 + 0.5 * Math.cos(th - THETA_BACK), 1.2))
+  + 0.12 * Math.sin(3 * th + ph) + 0.07 * Math.sin(2 * th + 2 * ph);
+// largest radius of the outermost paper at height y, pleat peaks and edge lift included (no clearance added)
+const surfMax = (y) => { const h = y - NECK_Y; return trumpetR(h) + layerOff(1, h) + foldA(h) + PAPER_CREASE * 0.03 + 0.08; };
+
+function layoutRoses() {
+  const N = ROSE_COUNT;
+  const items = [];
+  const buds = new Set(), full = new Set();
+  const pool = Array.from({ length: N - 1 }, (_, i) => i + 1).sort(() => Math.random() - 0.5);
+  pool.slice(0, Math.max(2, Math.round(N * 0.15))).forEach(i => buds.add(i));
+  pool.slice(Math.max(2, Math.round(N * 0.15)), Math.max(2, Math.round(N * 0.15)) + Math.round(N * 0.2)).forEach(i => full.add(i));
+
+  for (let i = 0; i < N; i++) {
+    const th = Math.acos(1 - (1 - Math.cos(TH_MAX)) * (i + 0.5) / N);
+    const az = i * GOLDEN;
+    const dir = new THREE.Vector3(Math.sin(th) * Math.cos(az), Math.cos(th), Math.sin(th) * Math.sin(az));
+    let scale = lerp(0.82, 0.58, th / TH_MAX) * rnd(0.92, 1.08);
+    let open = rnd(0.75, 1.05);
+    if (buds.has(i)) { open = rnd(0.4, 0.55); scale *= 0.82; }
+    if (full.has(i)) { open = rnd(1.15, 1.3); scale *= 1.05; }
+    items.push({ index: i, dir, scale, open, petals: Math.round((buds.has(i) ? 0.84 : 1) * PETALS * rnd(0.88, 1)) });
+  }
+  // relax overlaps along the dome so blossoms are packed tightly without interpenetrating
+  for (let it = 0; it < 80; it++) {
+    for (let a = 0; a < N; a++) for (let b = a + 1; b < N; b++) {
+      const A = items[a], B = items[b];
+      const pa = A.dir.clone().multiplyScalar(DOME_R), pb = B.dir.clone().multiplyScalar(DOME_R);
+      const d = pa.distanceTo(pb), minD = (A.scale + B.scale) * 1.2 * 0.82;
+      if (d < minD && d > 1e-4) {
+        const push = pa.sub(pb).multiplyScalar((minD - d) / d * 0.25 / DOME_R);
+        A.dir.add(push).normalize(); B.dir.sub(push).normalize();
+      }
+    }
+    for (const A of items) {                                      // keep inside the dome cap
+      const th = Math.acos(A.dir.y);
+      if (th > TH_MAX * 1.04) {
+        const h = Math.hypot(A.dir.x, A.dir.z), k = Math.sin(TH_MAX * 1.04) / h;
+        A.dir.set(A.dir.x * k, Math.cos(TH_MAX * 1.04), A.dir.z * k);
+      }
+    }
+  }
+  for (const A of items) {
+    A.origin = DOME_C.clone().addScaledVector(A.dir, DOME_R);
+    A.axis = A.dir.clone().add(new THREE.Vector3(rnd(-1, 1), rnd(-1, 1), rnd(-1, 1)).multiplyScalar(0.1)).normalize();
+  }
+  // small bud-like roses on the lowest row, peeking out over the paper rim and covering the gaps
+  for (let k = 0; k < EDGE_BUDS; k++) {
+    let best = null, bestScore = -1;
+    for (let c = 0; c < 60; c++) {
+      const th = rnd(1.08, 1.2), az = rnd(0, Math.PI * 2);
+      const dir = new THREE.Vector3(Math.sin(th) * Math.cos(az), Math.cos(th), Math.sin(th) * Math.sin(az));
+      const origin = DOME_C.clone().addScaledVector(dir, DOME_R - 0.1);
+      const scale = rnd(0.42, 0.52);
+      let score = 1e9;
+      for (const it of items) score = Math.min(score, origin.distanceTo(it.origin) / ((it.scale + scale) * 1.15));
+      if (score > bestScore) { bestScore = score; best = { dir, origin, scale }; }
+    }
+    items.push({
+      index: items.length, dir: best.dir, scale: best.scale, open: rnd(0.4, 0.5), petals: 26,
+      origin: best.origin,
+      axis: new THREE.Vector3(best.dir.x, best.dir.y * 0.6, best.dir.z).normalize(),
+    });
+  }
+  // the lowest blossoms must not poke through the paper wall: pull them toward the axis, and shrink them a little if that is not enough
+  for (const it of items) it.scale0 = it.scale;
+  for (let pass = 0; pass < 60; pass++) {
+    for (let a = 0; a < items.length; a++) for (let b = a + 1; b < items.length; b++) {
+      const A = items[a], B = items[b];
+      const dx = A.origin.x - B.origin.x, dy = A.origin.y - B.origin.y, dz = A.origin.z - B.origin.z;
+      const d = Math.hypot(dx, dy, dz), minD = (A.scale + B.scale) * 1.2 * 0.8, d2 = Math.hypot(dx, dz);
+      if (d < minD && d2 > 1e-4) {                                  // keep neighbours from piling up (horizontal push only)
+        const k = (minD - d) * 0.25 / d2;
+        A.origin.x += dx * k; A.origin.z += dz * k; B.origin.x -= dx * k; B.origin.z -= dz * k;
+      }
+    }
+    for (const it of items) {
+      const o = it.origin, hc = o.y - NECK_Y, ang = Math.atan2(o.z, o.x), reach = 1.2 * it.scale;
+      const rim = rimH(ang, 0.4) + HEIGHT_INNER;                    // rim of the innermost paper at this side
+      if (hc - reach * 0.7 >= rim) continue;                         // clearly above the paper
+      const hw = Math.min(hc, rim);
+      const lim = trumpetR(hw) + layerOff(-1, hw) - 0.12 - reach;    // wall radius of the inner paper, minus clearance and the blossom's own reach
+      const rho = Math.hypot(o.x, o.z);
+      if (rho > lim && lim > 0.4) {
+        it.scale = Math.max(it.scale0 * 0.8, it.scale * 0.985);
+        const k = lim / rho; o.x *= k; o.z *= k;
+      }
+    }
+  }
+  // 2–3 blossoms get a slightly different tone
+  const variants = [{ dh: 0, ds: 0.05, dl: -0.07 }, { dh: 0, ds: -0.04, dl: 0.06 }, { dh: rnd(0, 1) < 0.5 ? 0.025 : -0.025, ds: 0, dl: 0 }];
+  const vcount = 2 + Math.round(Math.random());
+  const order = items.map((_, i) => i).sort(() => Math.random() - 0.5);
+  for (let k = 0; k < vcount; k++) items[order[k]].variant = variants[k];
+  return items;
+}
+
+const roses = layoutRoses().map(spec => new Rose(spec));
+
+/* ---------- stems with thorns (one merged mesh) ---------- */
+const stemMaterial = new THREE.MeshStandardMaterial({ color: '#3b6a33', roughness: 0.6 });
+{
+  const parts = [];
+  for (const r of roses) {
+    const base = r.origin.clone().addScaledVector(r.axis, -0.55 * r.scale);
+    const bend = new THREE.Vector3(rnd(-1, 1), 0, rnd(-1, 1)).multiplyScalar(0.35);
+    const c1 = base.clone().addScaledVector(r.axis, -1.4).add(bend);
+    const c2 = GRIP.clone().add(new THREE.Vector3(rnd(-0.5, 0.5), 1.8, rnd(-0.5, 0.5)));
+    const end = GRIP.clone().add(new THREE.Vector3(rnd(-0.1, 0.1), 0, rnd(-0.1, 0.1)));
+    const curve = new THREE.CubicBezierCurve3(base, c1, c2, end);
+    r.stemCurve = curve;
+    parts.push(new THREE.TubeGeometry(curve, 36, 0.045, 6, false));
+    for (let k = 0; k < 4; k++) {                                   // thin thorns
+      const t = rnd(0.15, 0.7);
+      const p = curve.getPoint(t), tg = curve.getTangent(t);
+      const out = new THREE.Vector3(rnd(-1, 1), rnd(-0.2, 0.6), rnd(-1, 1)).normalize();
+      out.addScaledVector(tg, -out.dot(tg)).normalize();
+      const cone = new THREE.ConeGeometry(0.016, 0.09, 4);
+      cone.translate(0, 0.045, 0);
+      cone.applyQuaternion(new THREE.Quaternion().setFromUnitVectors(UP, out));
+      cone.translate(p.x, p.y, p.z);
+      parts.push(cone);
+    }
+  }
+  const mesh = new THREE.Mesh(mergeGeometries(parts, false), stemMaterial);
+  parts.forEach(g => g.dispose());
+  mesh.castShadow = true;
+  bouquet.add(mesh);
+}
+
+/* ---------- paper-fit: filler (baby's breath, eucalyptus) must stay inside the paper wall ---------- */
+const FIT_MARGIN = 0.06;                         // 3 mm (1 unit is about 5 cm)
+const fitStats = { gyp: null, euc: null };
+// radius of the innermost paper surface present at this point (bouquet frame), or Infinity above the tallest rim (nothing to pierce there)
+function paperInnerR(x, y, z) {
+  const h = y - NECK_Y, th = Math.atan2(z, x);
+  const rimMid = rimH(th, 1.2) + HEIGHT_MID + FIT_MARGIN;       // the tallest layer sets the mouth
+  if (h >= rimMid) return Infinity;
+  const rimIn = rimH(th, 0.4) + HEIGHT_INNER;
+  const off = h < rimIn ? layerOff(-1, h) : 0;                  // above the inner paper the mid paper is the innermost wall
+  return trumpetR(h) + off + foldAt(th, h) - 0.03;              // -0.03: the lowest shingled edge (lift)
+}
+// a point (+ its own radius e) pierces the paper if it is closer than the margin to the inner wall, or beyond it
+const pierces = (p, e) => Math.hypot(p.x, p.z) + e > paperInnerR(p.x, p.y, p.z) - FIT_MARGIN;
+const _fa = new THREE.Vector3(), _fb = new THREE.Vector3();
+// move every point of a branch: scale about its start (shorter), then tilt it toward the vertical about its start (inward)
+function branchMover(start, f, phi, dir) {
+  const axis = new THREE.Vector3().crossVectors(new THREE.Vector3(dir.x, 0, dir.z), UP).normalize();
+  const q = new THREE.Quaternion().setFromAxisAngle(axis, phi);
+  return (p) => p.clone().sub(start).multiplyScalar(f).applyQuaternion(q).add(start);
+}
+// try: full length, then shortened down to 40%; if that is not enough, tilt inward step by step (again trying lengths); else give up
+function fitBranch(start, end, test) {
+  const dir = end.clone().sub(start);
+  for (const phi of [0, 0.12, 0.25, 0.4, 0.6, 0.85]) {
+    if (phi > 0 && Math.hypot(dir.x, dir.z) < 1e-3) break;
+    for (let f = 1; f >= 0.4 - 1e-9; f -= 0.05) {
+      const mover = branchMover(start, f, phi, dir);
+      if (test(mover)) return { mover, mode: phi > 0 ? 'tilted' : f < 1 - 1e-9 ? 'shortened' : 'ok' };
+    }
+  }
+  return null;
+}
+
+/* ---------- filler: baby's breath (InstancedMesh blossoms on fine forked twigs) ---------- */
+let flowerMesh = null;
+const flowerJitter = [];
+const insideRose = (p, k) => roses.some(r => p.distanceTo(r.origin) < r.scale * 1.15 * k);
+{
+  // flowers and twig tips live only in a shell around the blossom surface: no tufts floating outside, nothing below the blooms
+  const inBand = (p, cap = 1.15) => {
+    const d = p.clone().sub(DOME_C), r = d.length();
+    if (r < DOME_R - 0.7 || r > DOME_R + 0.55) return false;          // at most ~10% beyond the outermost blossom edge
+    return Math.acos(d.y / r) <= cap;                                 // inside the cap, never below it
+  };
+  const twigParts = [];
+  const flowers = [];
+  const gypStat = fitStats.gyp = { sprigs: 0, buds: 0, badSprigs: 0, badBuds: 0, shortened: 0, tilted: 0, ok: 0, removed: 0, budsLost: 0, keptBuds: 0, afterBad: 0 };
+  let cur = null;                                                    // the sprig under construction: nothing is committed before it fits the paper
+  const twig = (a, b, radius) => cur.twigs.push({ a, b, radius });
+  const cluster = (c, n, cap = 1.15) => {
+    for (let i = 0; i < n; i++) {
+      const p = c.clone().add(new THREE.Vector3(rnd(-1, 1), rnd(-1, 1), rnd(-1, 1)).multiplyScalar(0.06));
+      if (inBand(p, cap) && !insideRose(p, 0.8)) cur.flowers.push({ p, r: rnd(0.02, 0.042) });
+    }
+  };
+  const makeSprig = (o) => {
+    // every sprig starts ON the stem bundle just above the grip and climbs through the gaps between the roses
+    const rose = roses[Math.floor(Math.random() * roses.length)];
+    const start = rose.stemCurve.getPoint(rnd(0.72, 0.95));
+    let end = null;
+    for (let tries = 0; tries < 40 && !end; tries++) {
+      const th = rnd(o.thLo, o.thHi), az = rnd(0, Math.PI * 2), R = DOME_R + rnd(o.rLo, o.rHi);
+      const e = DOME_C.clone().add(new THREE.Vector3(Math.sin(th) * Math.cos(az), Math.cos(th), Math.sin(th) * Math.sin(az)).multiplyScalar(R));
+      if (inBand(e, o.cap) && !insideRose(e, 0.8)) end = e;
+    }
+    if (!end) return;
+    const mid = start.clone().lerp(end, 0.5).add(new THREE.Vector3(rnd(-0.25, 0.25), 0, rnd(-0.25, 0.25)));
+    const curve = new THREE.QuadraticBezierCurve3(start, mid, end);
+    cur = { start, mid, end, twigs: [], flowers: [] };
+    for (let k = 0; k < 5; k++) {
+      let p = null;
+      for (let tries = 0; tries < 8 && !p; tries++) { const c = curve.getPoint(rnd(0.75, 0.98)); if (inBand(c, o.cap)) p = c; }
+      if (!p) continue;
+      const radial = p.clone().sub(DOME_C).normalize();
+      let q = null;
+      for (let tries = 0; tries < 12 && !q; tries++) {
+        const d = radial.clone().multiplyScalar(o.radial).add(new THREE.Vector3(rnd(-1, 1), rnd(-0.4, 1), rnd(-1, 1)).multiplyScalar(0.6)).normalize();
+        const c = p.clone().addScaledVector(d, rnd(0.3, 0.7));
+        if (inBand(c, o.cap) && !insideRose(c, 0.8)) q = c;
+      }
+      if (!q) continue;
+      twig(p, q, 0.005);
+      for (let m = 0; m < 3; m++) {
+        const sub = q.clone().addScaledVector(new THREE.Vector3(rnd(-1, 1), rnd(-0.2, 1), rnd(-1, 1)).normalize(), rnd(0.12, 0.3));
+        if (!inBand(sub, o.cap)) continue;
+        twig(q, sub, 0.004);
+        cluster(sub, 5, o.cap);
+      }
+      cluster(q, 4, o.cap);
+    }
+    cluster(end, 6, o.cap);
+    const rec = cur; cur = null;
+    // ---- fit to the paper: every sample of the main stem, both ends of every twig (and the middle), and every bud with its radius
+    const samples = (mv) => {
+      const c = new THREE.QuadraticBezierCurve3(mv(rec.start), mv(rec.mid), mv(rec.end)), out = [{ p: null, e: 0.007, c }];
+      out.length = 0;
+      for (let k = 0; k <= 14; k++) out.push({ p: c.getPoint(k / 14), e: 0.007 });
+      for (const t of rec.twigs) { const a = mv(t.a), b = mv(t.b); out.push({ p: a, e: t.radius }, { p: b, e: t.radius }, { p: a.clone().lerp(b, 0.5), e: t.radius }); }
+      for (const f of rec.flowers) out.push({ p: mv(f.p), e: f.r, bud: true });
+      return out;
+    };
+    const ident = (q) => q;
+    const bad = samples(ident).filter(x => pierces(x.p, x.e));
+    gypStat.sprigs++; gypStat.buds += rec.flowers.length;
+    if (bad.length) { gypStat.badSprigs++; gypStat.badBuds += bad.filter(x => x.bud).length; }
+    let mover = ident, mode = 'ok';
+    if (bad.length) {
+      const fit = fitBranch(rec.start, rec.end, (mv) => !samples(mv).some(x => pierces(x.p, x.e)));
+      if (!fit) { gypStat.removed++; gypStat.budsLost += rec.flowers.length; return; }
+      mover = fit.mover; mode = fit.mode;
+      gypStat[mode]++;
+    }
+    const curveF = new THREE.QuadraticBezierCurve3(mover(rec.start), mover(rec.mid), mover(rec.end));
+    twigParts.push(new THREE.TubeGeometry(curveF, 14, 0.007, 3, false));   // continuous thin stem back to the bundle
+    for (const t of rec.twigs) twigParts.push(new THREE.TubeGeometry(new THREE.LineCurve3(mover(t.a), mover(t.b)), 2, t.radius, 3, false));
+    for (const f of rec.flowers) flowers.push({ p: mover(f.p), r: f.r });
+    gypStat.keptBuds += rec.flowers.length;
+    // re-check what was committed (must be clean)
+    if (samples(mover).some(x => pierces(x.p, x.e))) gypStat.afterBad++;
+  };
+  for (let s = 0; s < BABYS_BREATH_SPRIGS; s++) makeSprig({ thLo: 0.12, thHi: 1.1, rLo: -0.35, rHi: 0.3, cap: 1.15, radial: 0.6 });
+  // from the side: along the paper rim, up and outward, hugging the outline of the bouquet
+  for (let s = 0; s < SIDE_SPRIGS; s++) makeSprig({ thLo: 1.0, thHi: 1.2, rLo: -0.1, rHi: 0.45, cap: 1.25, radial: 0.9 });
+  const twigMesh = new THREE.Mesh(mergeGeometries(twigParts, false), new THREE.MeshStandardMaterial({ color: '#6f8f5d', roughness: 0.7 }));
+  twigParts.forEach(g => g.dispose());
+  bouquet.add(twigMesh);
+
+  const fm = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1),
+    new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.55, emissive: '#2a2a2e' }), flowers.length);
+  const m4 = new THREE.Matrix4();
+  flowers.forEach((f, i) => {
+    m4.compose(f.p, new THREE.Quaternion(), new THREE.Vector3(f.r, f.r, f.r));
+    fm.setMatrixAt(i, m4);
+    flowerJitter[i] = 1 + rnd(-0.06, 0.06);          // each bud ±6% lighter / darker than the base colour
+    fm.setColorAt(i, new THREE.Color(1, 1, 1));
+  });
+  bouquet.add(fm);
+  flowerMesh = fm;
+}
+
+/* ---------- filler: eucalyptus (round grey-green leaves alternating along thin stems) ---------- */
+{
+  const stems = [];
+  const leafGeo = new THREE.CircleGeometry(1, 18);
+  {
+    const p = leafGeo.attributes.position;
+    for (let i = 0; i < p.count; i++) p.setZ(i, 0.35 * (p.getX(i) ** 2 + p.getY(i) ** 2));   // slightly cupped
+    leafGeo.computeVertexNormals();
+  }
+  const mats = [];
+  const eucStat = fitStats.euc = { stems: 0, leaves: 0, badStems: 0, badLeaves: 0, shortened: 0, tilted: 0, ok: 0, removed: 0, leavesLost: 0, afterBad: 0 };
+  // a stem + its leaves from the four control points; leaf looks come from fixed random numbers so a shortened stem keeps the same leaves
+  const buildEuca = (st, mv) => {
+    const curve = new THREE.CubicBezierCurve3(mv(st.start), mv(st.c1), mv(st.c2), mv(st.end));
+    const leaves = [];
+    const n = st.leafRnd.length;
+    for (let k = 0; k < n; k++) {
+      const t = lerp(0.4, 0.99, k / (n - 1));
+      const P = curve.getPoint(t), T = curve.getTangent(t);
+      const ref = Math.abs(T.y) > 0.9 ? new THREE.Vector3(1, 0, 0) : UP;
+      const side = new THREE.Vector3().crossVectors(T, ref).normalize();
+      side.applyAxisAngle(T, k * 1.9 + st.leafRnd[k][0]);        // alternate around the stem
+      const size = lerp(0.24, 0.15, t) * st.leafRnd[k][1];
+      const ex = side.clone().multiplyScalar(Math.cos(0.5)).addScaledVector(T, Math.sin(0.5)).normalize();
+      const ez = new THREE.Vector3().crossVectors(ex, T).normalize();
+      const ey = new THREE.Vector3().crossVectors(ez, ex).normalize();
+      const c = P.clone().addScaledVector(ex, size * 0.95);
+      leaves.push({ c, ex, ey, ez, size });
+    }
+    return { curve, leaves };
+  };
+  const eucPoints = (b) => {
+    const out = [];
+    for (let k = 0; k <= 24; k++) out.push({ p: b.curve.getPoint(k / 24), e: 0.012 });
+    b.leaves.forEach((l, li) => {
+      out.push({ p: l.c, e: 0, leaf: li });
+      for (const [a, sgn] of [[l.ex, 1], [l.ex, -1], [l.ey, 1], [l.ey, -1]]) out.push({ p: l.c.clone().addScaledVector(a, sgn * l.size), e: 0, leaf: li });
+    });
+    return out;
+  };
+  for (let s = 0; s < EUCALYPTUS_STEMS; s++) {
+    // start inside the bouquet, point outward and clearly upward (never closer to horizontal than ~45°)
+    const th = rnd(0.3, 0.8), az = (s / EUCALYPTUS_STEMS) * Math.PI * 2 + rnd(-0.2, 0.2);
+    const dirS = new THREE.Vector3(Math.sin(th) * Math.cos(az), Math.cos(th), Math.sin(th) * Math.sin(az));
+    const R = DOME_R + rnd(0.3, 1.5);
+    const end = DOME_C.clone().addScaledVector(dirS, R);
+    const start = DOME_C.clone().addScaledVector(dirS, DOME_R - rnd(2.2, 2.7));
+    const c1 = start.clone().lerp(end, 0.35).add(new THREE.Vector3(rnd(-0.2, 0.2), 0.2, rnd(-0.2, 0.2)));
+    const c2 = start.clone().lerp(end, 0.7).add(new THREE.Vector3(rnd(-0.2, 0.2), 0.25, rnd(-0.2, 0.2)));
+    const nLeaves = 12 + Math.floor(Math.random() * 4);
+    const leafRnd = [];
+    for (let k = 0; k < nLeaves; k++) leafRnd.push([rnd(-0.3, 0.3), rnd(0.85, 1.15)]);
+    const st = { start, c1, c2, end, leafRnd };
+    const ident = (q) => q;
+    const badPts = eucPoints(buildEuca(st, ident)).filter(x => pierces(x.p, x.e));
+    eucStat.stems++; eucStat.leaves += nLeaves;
+    let mover = ident;
+    if (badPts.length) {
+      eucStat.badStems++; eucStat.badLeaves += new Set(badPts.filter(x => x.leaf !== undefined).map(x => x.leaf)).size;
+      const fit = fitBranch(start, end, (mv) => !eucPoints(buildEuca(st, mv)).some(x => pierces(x.p, x.e)));
+      if (!fit) { eucStat.removed++; eucStat.leavesLost += nLeaves; continue; }
+      mover = fit.mover; eucStat[fit.mode]++;
+    }
+    const built = buildEuca(st, mover);
+    if (eucPoints(built).some(x => pierces(x.p, x.e))) eucStat.afterBad++;
+    stems.push(new THREE.TubeGeometry(built.curve, 24, 0.012, 4, false));
+    for (const l of built.leaves) {
+      const m = new THREE.Matrix4().makeBasis(l.ex.clone().multiplyScalar(l.size), l.ey.clone().multiplyScalar(l.size), l.ez.clone().multiplyScalar(l.size));
+      m.setPosition(l.c);
+      mats.push(m);
+    }
+  }
+  const stemMesh = new THREE.Mesh(mergeGeometries(stems, false), new THREE.MeshStandardMaterial({ color: '#7c9483', roughness: 0.6 }));
+  stems.forEach(g => g.dispose());
+  bouquet.add(stemMesh);
+
+  const lm = new THREE.InstancedMesh(leafGeo,
+    new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.6, side: THREE.DoubleSide }), mats.length);
+  const col = new THREE.Color();
+  mats.forEach((m, i) => { lm.setMatrixAt(i, m); lm.setColorAt(i, col.setHSL(rnd(0.33, 0.4), rnd(0.12, 0.22), rnd(0.55, 0.68))); });
+  lm.castShadow = false;
+  bouquet.add(lm);
+}
+
+/* =====================================================================
+ *  包裝（重寫）：多張獨立的大張紙（三層）+ 薄紗裙襬 + 單一蝴蝶結（剖面函數見上方 trumpetR / layerOff / rimH）
+ * ===================================================================== */
+const timeU = { value: 0 };       // drives the ribbon-tail breeze in the shader
+const ruffleU = { value: 0 };     // 0..1: frilled rim of the middle paper (pink style)
+
+/* ---------- one big sheet: high-density surface, rolled rim, rounded corners, Laplacian-smoothed ---------- */
+const ROWS_TAIL = 14, ROWS_BODY = 50, COLS = 48;      // 65 x 49 vertices per sheet
+function makeSheet(sign, center, hw, idx, o) {
+  const rows = ROWS_TAIL + ROWS_BODY + 1, cols = COLS + 1, M = rows * cols;
+  const P = new Float32Array(M * 3), UV = new Float32Array(M * 4), RUF = new Float32Array(M * 6);
+  const rollJ = rnd(0.85, 1.0), botJ = 1 + rnd(0, 0.03);
+  const Rbase = (th, h, u) => trumpetR(h) + layerOff(sign, h) + (idx % 2) * 0.02 + foldAt(th, h) + lift(u);
+  for (let j = 0; j < cols; j++) {
+    const u = j / COLS, th = center + (u - 0.5) * 2 * hw;
+    const du = Math.min(u, 1 - u);
+    const drop = du < 0.18 ? 0.6 * (1 - Math.sqrt(1 - ((0.18 - du) / 0.18) ** 2)) : 0;   // rounded corners, radius >= 18% of the sheet width
+    const hTop = rimH(th, o.rimPh) + o.hOff - drop;
+    const h0 = hTop * 0.85;                                                                // the last 15% rolls over
+    for (let i = 0; i < rows; i++) {
+      const h = i <= ROWS_TAIL ? -TAIL_LEN * botJ * (1 - i / ROWS_TAIL) : hTop * (i - ROWS_TAIL) / ROWS_BODY;
+      let R, y;
+      if (h > h0) {
+        const rollK = smooth(0.02, 0.3, du);                                              // the roll fades out toward the rounded corners: no horns
+        const s = (h - h0) / (hTop - h0), alpha = Math.PI * 0.92 * s * rollK, rho = ROLL_SIZE * rollJ;
+        const R0 = Rbase(th, h0, u), dR = (Rbase(th, h0 + 0.05, u) - Rbase(th, h0 - 0.05, u)) / 0.1;
+        const n = Math.hypot(dR, 1), Tx = dR / n, Ty = 1 / n, Nx = 1 / n, Ny = -dR / n;   // tangent and outward-down normal: C1-smooth roll
+        R = R0 + rho * (Math.sin(alpha) * Tx + (1 - Math.cos(alpha)) * Nx);
+        y = NECK_Y + h0 + rho * (Math.sin(alpha) * Ty + (1 - Math.cos(alpha)) * Ny);
+      } else { R = Rbase(th, h, u); y = NECK_Y + h; }
+      const q = i * cols + j, cx = Math.cos(th), sz = Math.sin(th);
+      P[q * 3] = R * cx; P[q * 3 + 1] = y; P[q * 3 + 2] = R * sz;
+      UV[q * 2] = 1 - u; UV[q * 2 + 1] = i / (rows - 1);          // u runs against theta so the print reads correctly from outside
+      const z = i > ROWS_TAIL ? smooth(0.85, 1, (i - ROWS_TAIL) / ROWS_BODY) : 0;       // frilled rim offset (pink style)
+      const w1 = Math.sin(14 * th + o.rimPh), w2 = Math.sin(14 * th + o.rimPh + 1);
+      RUF[q * 3] = cx * 0.22 * w1 * z; RUF[q * 3 + 1] = 0.28 * w2 * z; RUF[q * 3 + 2] = sz * 0.22 * w1 * z;
+    }
+  }
+  // 4 passes of Laplacian smoothing; the neck row, the tail's bottom row and the outline stay fixed
+  const tmp = new Float32Array(P.length);
+  for (let pass = 0; pass < 4; pass++) {
+    tmp.set(P);
+    for (let i = 1; i < rows - 1; i++) {
+      if (i === ROWS_TAIL) continue;
+      for (let j = 1; j < cols - 1; j++) for (let c = 0; c < 3; c++) {
+        const a = (i * cols + j) * 3 + c;
+        const avg = (tmp[a - 3] + tmp[a + 3] + tmp[a - cols * 3] + tmp[a + cols * 3]) / 4;
+        P[a] = tmp[a] + 0.45 * (avg - tmp[a]);
+      }
+    }
+  }
+  const tri = [];
+  for (let i = 0; i < rows - 1; i++) for (let j = 0; j < cols - 1; j++) {
+    const a = i * cols + j, b = (i + 1) * cols + j, c = b + 1, d = a + 1;
+    tri.push(a, b, c, a, c, d);
+  }
+  // second skin = thickness (~1.5 mm), offset along the smoothed normals, pointing away from the axis
+  const g0 = new THREE.BufferGeometry();
+  g0.setAttribute('position', new THREE.BufferAttribute(P, 3));
+  g0.setIndex(tri);
+  g0.computeVertexNormals();
+  const nrm = g0.attributes.normal.array;
+  g0.dispose();
+  let sg = 0;
+  for (let q = 0; q < M; q += 7) sg += nrm[q * 3] * P[q * 3] + nrm[q * 3 + 2] * P[q * 3 + 2];
+  sg = sg >= 0 ? 1 : -1;
+  const pos = new Float32Array(M * 6), uv = new Float32Array(M * 4), ruf = new Float32Array(M * 6);
+  pos.set(P, 0); uv.set(UV.subarray(0, M * 2), 0); uv.set(UV.subarray(0, M * 2), M * 2); ruf.set(RUF.subarray(0, M * 3), 0); ruf.set(RUF.subarray(0, M * 3), M * 3);
+  for (let q = 0; q < M; q++) for (let c = 0; c < 3; c++) pos[(M + q) * 3 + c] = P[q * 3 + c] + nrm[q * 3 + c] * PAPER_THICK * sg;
+  const idx2 = [];
+  for (let n = 0; n < tri.length; n += 3) {
+    idx2.push(tri[n], tri[n + 1], tri[n + 2]);
+    idx2.push(M + tri[n], M + tri[n + 2], M + tri[n + 1]);
+  }
+  const edge = (a, b) => idx2.push(a, b, M + b, a, M + b, M + a);
+  for (let j = 0; j < cols - 1; j++) { edge(j, j + 1); edge((rows - 1) * cols + j, (rows - 1) * cols + j + 1); }
+  for (let i = 0; i < rows - 1; i++) { edge(i * cols, (i + 1) * cols); edge(i * cols + cols - 1, (i + 1) * cols + cols - 1); }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv.subarray(0, M * 4), 2));
+  g.setAttribute('ruf', new THREE.BufferAttribute(ruf.subarray(0, M * 6), 3));
+  g.setIndex(idx2);
+  g.computeVertexNormals();                              // smooth shading, never flat
+  return g;
+}
+
+/* ---------- tulle skirt: wide frilled ring gathered at the neck, reaching ~2/3 up the paper; its outer edge never exceeds the paper mouth ---------- */
+function tulleGeometry(nT = 160, nS = 48) {
+  const cols = nT + 1, rows = nS + 1;
+  const pos = new Float32Array(rows * cols * 3), uv = new Float32Array(rows * cols * 2);
+  const cap = PAPER_RIM_RADIUS + RIM_GAP - 0.02;                // outer paper mouth radius
+  for (let i = 0; i < rows; i++) {
+    const w = i / nS;
+    for (let j = 0; j < cols; j++) {
+      const th = j / nT * Math.PI * 2;
+      const hLo = 0.85 + 0.1 * Math.sin(7 * th + 1);
+      // reaches ~2/3 up the paper, but never above the outer paper layer (above it the skirt would stand away from the wall)
+      const hHi = Math.min((2 / 3) * rimH(th, 2.1), rimH(th, 2.0) + HEIGHT_OUTER - 0.5) + 0.12 * Math.sin(11 * th + 0.6) + 0.05 * Math.sin(17 * th);   // soft scalloped edge
+      const h = lerp(hLo, hHi, w);
+      const frill = 0.1 * Math.exp(-h / 1.3) * Math.sin(11 * th) + 0.04 * Math.sin(13 * th + 1) * smooth(0.5, 1, w);   // displacement <= 0.14
+      const R = Math.min(trumpetR(h) + layerOff(1, h) + foldA(h) + 0.2 + frill, cap);
+      const q = i * cols + j;
+      pos[q * 3] = R * Math.cos(th); pos[q * 3 + 1] = NECK_Y + h; pos[q * 3 + 2] = R * Math.sin(th);
+      uv[q * 2] = j / nT; uv[q * 2 + 1] = w;
+    }
+  }
+  const idx = [];
+  for (let i = 0; i < rows - 1; i++) for (let j = 0; j < cols - 1; j++) {
+    const a = i * cols + j, b = (i + 1) * cols + j, c = b + 1, d = a + 1;
+    idx.push(a, b, c, a, c, d);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  const n = g.attributes.normal.array;
+  for (let i = 0; i < rows; i++) {
+    const a = (i * cols) * 3, b = (i * cols + nT) * 3;
+    for (let c = 0; c < 3; c++) { const m = (n[a + c] + n[b + c]) * 0.5; n[a + c] = n[b + c] = m; }
+  }
+  return g;
+}
+
+/* ---------- procedural textures ---------- */
+function makeFiberTexture() {
+  const S = 512;
+  const c = document.createElement('canvas');
+  c.width = c.height = S;
+  const g = c.getContext('2d');
+  const img = g.createImageData(S, S);
+  for (let i = 0; i < S * S; i++) {
+    const v = 238 + (Math.random() - 0.5) * 22;
+    img.data[i * 4] = img.data[i * 4 + 1] = img.data[i * 4 + 2] = v; img.data[i * 4 + 3] = 255;
+  }
+  g.putImageData(img, 0, 0);
+  for (let k = 0; k < 1800; k++) {
+    const x = Math.random() * S, y = Math.random() * S, a = Math.random() * Math.PI, l = rnd(6, 22);
+    g.strokeStyle = Math.random() < 0.5 ? 'rgba(255,255,255,0.35)' : 'rgba(120,110,100,0.16)';
+    g.lineWidth = rnd(0.6, 1.3);
+    g.beginPath(); g.moveTo(x, y); g.lineTo(x + Math.cos(a) * l, y + Math.sin(a) * l); g.stroke();
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.repeat.set(5, 3);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return t;
+}
+
+// printed once per sheet (uv = sheet): big diagonal lettering that follows the paper's curvature
+const printCache = {};
+function getPrintTexture(st) {
+  const key = `${st.text}|${st.bg}|${st.border}|${st.ink}`;
+  if (printCache[key]) return printCache[key];
+  const W = 1600, H = 1024;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  g.fillStyle = `rgb(${st.bg},${st.bg},${st.bg})`;
+  g.fillRect(0, 0, W, H);
+  if (st.text) {
+    const words = PAPER_TEXT.split(' ');
+    const big = words.pop(), small = words.join(' ');
+    g.save();
+    g.translate(W * 0.5, H * 0.13);                      // the visible band of the back sheets is the top of the sheet
+    g.rotate(-0.36);
+    g.fillStyle = st.ink;
+    g.textAlign = 'center';
+    g.textBaseline = 'middle';
+    g.font = 'italic 600 90px "Brush Script MT","Segoe Script","Snell Roundhand","Lucida Handwriting",Georgia,serif';
+    g.fillText(small, -60, -55);
+    g.font = '600 170px Georgia,"Times New Roman",serif';
+    g.fillText(big, 70, 60);
+    g.restore();
+  }
+  if (st.border) {                                       // light fine edge: the rim is at the top of the sheet
+    g.fillStyle = 'rgb(255,246,247)';
+    g.fillRect(0, 0, W, 64);
+    g.fillRect(0, 84, W, 7);
+  }
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.anisotropy = 4;
+  return (printCache[key] = t);
+}
+
+const SELVEDGE = 0.03, BODY_TONE = 0.893;       // each woven edge = 3% of the width, 12% brighter than the body (the vertex colours carry the 1.12 back)
+function makeRibbonTexture() {
+  const W = 1024, H = 256;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const body = Math.round(255 * BODY_TONE);
+  g.fillStyle = `rgb(${body},${body},${body})`;
+  g.fillRect(0, 0, W, H);
+  g.fillStyle = '#fff';                                              // woven edges: v < 3% and v > 97%
+  g.fillRect(0, 0, W, H * SELVEDGE); g.fillRect(0, H * (1 - SELVEDGE), W, H * SELVEDGE);
+  g.fillStyle = 'rgba(0,0,0,0.13)';
+  g.font = 'italic 34px Georgia,serif';
+  g.textBaseline = 'middle';
+  g.save(); g.scale(1, 2);
+  for (let y = -60; y < H / 2 + 80; y += 62) for (let x = -200 + ((y / 62) & 1) * 140; x < W + 200; x += 330) {
+    g.save(); g.translate(x, y); g.rotate(-0.35); g.fillText(RIBBON_TEXT, 0, 0); g.restore();
+  }
+  g.restore();
+  const t = new THREE.CanvasTexture(c);
+  t.colorSpace = THREE.SRGBColorSpace;
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  t.anisotropy = 4;
+  return t;
+}
+// thread relief as a tangent-space normal map: fine lines along the length (u), `lines` of them across the width (v)
+function makeThreadNormal(lines, speckle, W) {
+  const H = 512;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const img = g.createImageData(W, H);
+  for (let y = 0; y < H; y++) {
+    const v = y / H, ph = v * lines * Math.PI * 2;
+    const slope = Math.cos(ph) * 0.9 + 0.25 * Math.cos(ph * 2.7 + 1.3);
+    for (let x = 0; x < W; x++) {
+      let nx = 0, ny = -slope;
+      if (speckle && ((x * 31 + y * 17) * 2654435761 >>> 0) % 997 < speckle) { nx = ((x * 7 + y) % 5 - 2) * 0.35; ny += ((x + y * 3) % 5 - 2) * 0.35; }
+      const l = Math.hypot(nx, ny, 1.2), k = (y * W + x) * 4;
+      img.data[k] = 128 + 127 * nx / l; img.data[k + 1] = 128 + 127 * ny / l; img.data[k + 2] = 128 + 127 * 1.2 / l; img.data[k + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+// the knot: the same thread lines plus 8 pleats around the ring (uv u = angle / 2pi * 2, so 4 pleats per uv unit)
+function makeKnotNormal() {
+  const W = 256, H = 512;
+  const c = document.createElement('canvas');
+  c.width = W; c.height = H;
+  const g = c.getContext('2d');
+  const img = g.createImageData(W, H);
+  for (let y = 0; y < H; y++) {
+    const ph = y / H * 50 * Math.PI * 2, ny0 = -(Math.cos(ph) * 0.9 + 0.25 * Math.cos(ph * 2.7 + 1.3));
+    for (let x = 0; x < W; x++) {
+      const pu = x / W * 4 * Math.PI * 2 + 0.25, nx = -1.6 * (Math.cos(pu) * 0.8 + 0.2 * Math.cos(pu * 2.3 + 1.1));
+      const l = Math.hypot(nx, ny0, 1.2), k = (y * W + x) * 4;
+      img.data[k] = 128 + 127 * nx / l; img.data[k + 1] = 128 + 127 * ny0 / l; img.data[k + 2] = 128 + 127 * 1.2 / l; img.data[k + 3] = 255;
+    }
+  }
+  g.putImageData(img, 0, 0);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+// hem mask for the sheer ribbon: white = more opaque border (3% each side), black = body
+function makeHemMask() {
+  const c = document.createElement('canvas');
+  c.width = 4; c.height = 256;
+  const g = c.getContext('2d');
+  g.fillStyle = '#000'; g.fillRect(0, 0, 4, 256);
+  g.fillStyle = '#fff'; g.fillRect(0, 0, 4, 256 * SELVEDGE); g.fillRect(0, 256 * (1 - SELVEDGE), 4, 256 * SELVEDGE);
+  const t = new THREE.CanvasTexture(c);
+  t.wrapS = t.wrapT = THREE.RepeatWrapping;
+  return t;
+}
+
+/* ---------- materials + meshes ---------- */
+const fiberTex = makeFiberTexture();
+const mkPaperMat = (map) => new THREE.MeshStandardMaterial({
+  color: 0xffffff, roughness: 0.8, metalness: 0, side: THREE.DoubleSide, map, bumpMap: fiberTex, bumpScale: 0.6,
+  polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1,           // no flicker where layers get close
+});
+const layerMats = { inner: mkPaperMat(fiberTex), outer: mkPaperMat(fiberTex), midPrint: mkPaperMat(null), midPlain: mkPaperMat(null) };
+for (const m of [layerMats.midPrint, layerMats.midPlain]) {
+  m.onBeforeCompile = (shader) => {                     // frilled rim (pink style): offset blended by a uniform
+    shader.uniforms.uRuffle = ruffleU;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute vec3 ruf;\nuniform float uRuffle;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\ntransformed += ruf * uRuffle;');
+  };
+}
+const tulleMat = new THREE.MeshPhysicalMaterial({
+  color: '#fff5e4', transparent: true, opacity: 0.45, side: THREE.DoubleSide, depthWrite: false,
+  roughness: 0.65, metalness: 0, sheen: 0.6, sheenColor: new THREE.Color('#ffffff'),
+});
+let tulleMesh;
+
+{
+  const D2R = Math.PI / 180;
+  // A inner: 5 sheets, B middle: 4 sheets (slightly larger, offset), C outer: 5 sheets. Neighbours overlap by ~30 degrees so that no
+  // seam or gap ever shows the layer below (the rounded corners are only ~20 degrees wide).
+  const defs = [
+    { key: 'inner', sign: -1, n: 5, hw: 52 * D2R, th0: 0.3,                       rimPh: 0.4, hOff: HEIGHT_INNER },
+    { key: 'mid',   sign: 0,  n: 4, hw: 60 * D2R, th0: THETA_BACK + Math.PI / 4, rimPh: 1.2, hOff: HEIGHT_MID },
+    { key: 'outer', sign: 1,  n: OUTER_N, hw: OUTER_HW, th0: OUTER_TH0,                       rimPh: 2.0, hOff: HEIGHT_OUTER },
+  ];
+  for (const d of defs) for (let k = 0; k < d.n; k++) {
+    const center = d.th0 + k * Math.PI * 2 / d.n;
+    // the printed paper is only on the middle sheets facing the back, where the lettering is seen above the flowers
+    const mat = d.key === 'mid' ? (Math.abs(wrapAngle(center - THETA_BACK)) < 1.2 ? layerMats.midPrint : layerMats.midPlain) : layerMats[d.key];
+    const m = new THREE.Mesh(makeSheet(d.sign, center, d.hw, k, d), mat);
+    m.castShadow = true;
+    m.receiveShadow = true;
+    bouquet.add(m);
+  }
+  tulleMesh = new THREE.Mesh(tulleGeometry(), tulleMat);
+  tulleMesh.renderOrder = 2;
+  tulleMesh.receiveShadow = true;
+  bouquet.add(tulleMesh);
+}
+
+/* ---------- ribbon: zero-thickness double-sided band surfaces (no extruded bars, no end faces) ---------- */
+const BAND_GAP = 0.03;      // the narrow band sits ~1.5 mm above the paper (1 unit is about 5 cm); 1 mm let pleat peaks between mesh samples poke through
+const FAR_GAP = 0.1;        // loops and tails keep ~5 mm clear of the paper
+
+// outermost paper surface at azimuth th (x = R cos th, z = R sin th) and height h above the neck; follows the pleats of the outer sheets
+function outerSurfaceR(th, h) {
+  let best = 0;
+  for (let k = 0; k < OUTER_N; k++) {
+    const d = wrapAngle(th - (OUTER_TH0 + k * Math.PI * 2 / OUTER_N));
+    if (Math.abs(d) > OUTER_HW) continue;
+    const R = trumpetR(h) + layerOff(1, h) + (k % 2) * 0.02 + foldAt(th, h) + lift(d / (2 * OUTER_HW) + 0.5);
+    if (R > best) best = R;
+  }
+  return (best || trumpetR(h) + layerOff(1, h) + foldA(h)) + PAPER_THICK;      // + the second skin
+}
+
+const rotAxis = new THREE.Vector3();
+// rotation-minimizing (parallel transport) frames along a polyline: the side vector never flips or twists by itself.
+// With endSide given, the leftover twist at the end is spread evenly along the curve (closed curves).
+function ribbonFramesPT(P, side0, endSide) {
+  const n = P.length, T = [], S = [];
+  for (let i = 0; i < n; i++) T.push(P[Math.min(n - 1, i + 1)].clone().sub(P[Math.max(0, i - 1)]).normalize());
+  S.push(side0.clone().addScaledVector(T[0], -side0.dot(T[0])).normalize());
+  for (let i = 1; i < n; i++) {
+    const sv = S[i - 1].clone();
+    rotAxis.crossVectors(T[i - 1], T[i]);
+    const s = rotAxis.length();
+    if (s > 1e-7) sv.applyAxisAngle(rotAxis.divideScalar(s), Math.atan2(s, T[i - 1].dot(T[i])));
+    S.push(sv.addScaledVector(T[i], -sv.dot(T[i])).normalize());
+  }
+  if (endSide) {
+    const d = endSide.clone().addScaledVector(T[n - 1], -endSide.dot(T[n - 1])).normalize();
+    const delta = Math.atan2(T[n - 1].dot(new THREE.Vector3().crossVectors(S[n - 1], d)), S[n - 1].dot(d));
+    for (let i = 0; i < n; i++) S[i].applyAxisAngle(T[i], delta * i / (n - 1));
+  }
+  return { T, S };
+}
+
+// a band surface: for every centre sample, the cross-section runs from -w/2 to +w/2 along the side vector.
+// wrap = true: the last sample equals the first and is welded to it (shared vertices, so position and normal are identical).
+// loops: the root is ~8% darker, the outside of the bend a little brighter (1 / BODY_TONE restores the body tone under the map)
+function ribbonSurface(P, fr, widthFn, twistFn, rippleFn, m, wrap, swayFn, edgeFn) {
+  const n = P.length, ns = wrap ? n - 1 : n, cols = m + 1;
+  const pos = new Float32Array(ns * cols * 3), uv = new Float32Array(ns * cols * 2), col = new Float32Array(ns * cols * 3), sway = new Float32Array(ns * cols);
+  const S = new THREE.Vector3(), N = new THREE.Vector3();
+  let len = 0;
+  const shade = (t) => (1 / BODY_TONE) * (1 - 0.08 * (1 - smooth(0, 0.3, Math.min(t, 1 - t)))) * (1 + 0.06 * (1 - Math.cos(t * Math.PI * 2)) / 2);
+  for (let i = 0; i < ns; i++) {
+    const t = i / (n - 1);
+    if (i > 0) len += P[i].distanceTo(P[i - 1]);
+    S.copy(fr.S[i]);
+    const tw = twistFn(t);
+    if (tw) S.applyAxisAngle(fr.T[i], tw);
+    N.crossVectors(fr.T[i], S);
+    const w = widthFn(t);
+    for (let j = 0; j < cols; j++) {
+      const v = -1 + 2 * j / m, q = i * cols + j, r = rippleFn(t, v), ev = edgeFn ? edgeFn(t, v) * w : 0;   // ev: the free edge waves sideways
+      pos[q * 3] = P[i].x + S.x * (v * w / 2 + ev) + N.x * r;
+      pos[q * 3 + 1] = P[i].y + S.y * (v * w / 2 + ev) + N.y * r;
+      pos[q * 3 + 2] = P[i].z + S.z * (v * w / 2 + ev) + N.z * r;
+      uv[q * 2] = len / 1.6; uv[q * 2 + 1] = (v + 1) / 2;
+      col[q * 3] = col[q * 3 + 1] = col[q * 3 + 2] = shade(t);
+      sway[q] = swayFn(t);
+    }
+  }
+  return finishGrid(pos, uv, col, sway, ns, cols, wrap);
+}
+
+function finishGrid(pos, uv, col, sway, ns, cols, wrap) {
+  const idx = [];
+  for (let i = 0; i < (wrap ? ns : ns - 1); i++) for (let j = 0; j < cols - 1; j++) {
+    const a = i * cols + j, b = ((i + 1) % ns) * cols + j;
+    idx.push(a, b, b + 1, a, b + 1, a + 1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.BufferAttribute(uv, 2));
+  g.setAttribute('color', new THREE.BufferAttribute(col, 3));
+  g.setAttribute('sway', new THREE.BufferAttribute(sway, 1));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+
+// ring that hugs the neck (azimuth-dependent radius = the paper's own radius + 1 mm)
+function bandGeometry(w, ns = 192, m = 6) {
+  const cols = m + 1;
+  const pos = new Float32Array(ns * cols * 3), uv = new Float32Array(ns * cols * 2), col = new Float32Array(ns * cols * 3), sway = new Float32Array(ns * cols);
+  for (let i = 0; i < ns; i++) {
+    const th = i / ns * Math.PI * 2;
+    for (let j = 0; j < cols; j++) {
+      const v = -1 + 2 * j / m, q = i * cols + j, R = outerSurfaceR(th, v * w / 2) + BAND_GAP;   // radius sampled at this row's own height: the paper flares above the neck
+      pos[q * 3] = R * Math.cos(th); pos[q * 3 + 1] = NECK_Y + v * w / 2; pos[q * 3 + 2] = R * Math.sin(th);
+      uv[q * 2] = i / ns * 8; uv[q * 2 + 1] = (v + 1) / 2;
+      col[q * 3] = col[q * 3 + 1] = col[q * 3 + 2] = 1 / BODY_TONE;
+    }
+  }
+  return finishGrid(pos, uv, col, sway, ns, cols, true);
+}
+
+// z of the outermost paper surface at lateral position x and height h above the neck (solves x = R cos th, z = R sin th)
+function paperZ(x, h) {
+  let th = Math.PI / 2, R = 0;
+  for (let k = 0; k < 5; k++) { R = outerSurfaceR(th, h); th = Math.acos(Math.max(-1, Math.min(1, x / R))); }
+  return R * Math.sin(th);
+}
+
+// the knot: one closed rounded-rectangle ring (axis along x) that fully wraps the loop roots and the tops of the tails.
+// Loops leave through its open ends, tails come out of its lower side. Its back half follows the paper surface exactly (+ BAND_GAP + 3 mm,
+// i.e. it overlaps the neck band instead of floating over it), so there is no gap between the knot and the band at any angle.
+function knotGeometry(L, zb, zf, ky, bw, ns = 96, m = 20) {
+  const cols = m + 1, zc = (zb + zf) / 2, kz = (zf - zb) / 2, e = 2 / 4;           // superellipse exponent 4: rounded rectangle
+  const pos = new Float32Array(ns * cols * 3), uv = new Float32Array(ns * cols * 2), col = new Float32Array(ns * cols * 3), sway = new Float32Array(ns * cols);
+  for (let i = 0; i < ns; i++) {
+    const a = i / ns * Math.PI * 2, ca = Math.cos(a), sa = Math.sin(a);
+    const cy = ky * Math.sign(ca) * Math.pow(Math.abs(ca), e), cz = kz * Math.sign(sa) * Math.pow(Math.abs(sa), e);
+    const back = smooth(0, 0.9, -sa);                                              // 1 on the back face, 0 on the front half
+    for (let j = 0; j < cols; j++) {
+      const x = -L / 2 + L * j / m, q = i * cols + j;
+      const sh = Math.min(1, Math.max(0, (Math.abs(2 * x / L) - 0.62) / 0.38));                               // 0..1 over the last 38% of the length
+      const puff = (1 + 0.08 * (1 - (2 * x / L) ** 2)) * (1 - 0.6 * (1 - Math.sqrt(1 - sh * sh)));          // quarter-circle shoulder: a rounded-rectangle band whose ends close in tightly round the ribbon
+      const ax = Math.abs(2 * x / L);
+      // 8 pleats drawn out along the band (4 of them on the visible front half), shallow at the pinched ends; a soft dent in the middle of the front
+      const pleat = 0.009 * bw * Math.sin(8 * a + 0.5) * (1 - back);                                       // the pleats are in the normal map; the displacement stays under 1% of the ribbon width
+      const dent = -0.16 * kz * Math.exp(-((x / (0.32 * L)) ** 2)) * Math.max(0, sa) * Math.max(0, 1 - Math.abs(ca) * 1.3);
+      const y = cy * puff + (pleat + dent) * ca * 0.5;
+      let z = zc + cz * puff + pleat + dent;
+      const zp = paperZ(x, y) + BAND_GAP + 0.015;                                  // never below the band, and the back hugs the paper
+      z = Math.max(lerp(z, zp, back), zp);
+      pos[q * 3] = x; pos[q * 3 + 1] = NECK_Y + y; pos[q * 3 + 2] = z;
+      uv[q * 2] = i / ns * 2; uv[q * 2 + 1] = j / m;
+      col[q * 3] = col[q * 3 + 1] = col[q * 3 + 2] = 1 / BODY_TONE;
+    }
+  }
+  return finishGrid(pos, uv, col, sway, ns, cols, true);
+}
+
+// a tail: a surface wrapped onto the paper tail. Each vertex sits at the paper's own radius for its azimuth and height + 5 mm,
+// so it follows the pleats; the end is a swallow-tail (V notch); the top narrows to 50% and is hidden inside the knot.
+function tailGeometry(dir, bw, yTop, len, notch = 0.16, nu = 48, nv = 16) {
+  const cols = nv + 1;
+  const pos = new Float32Array((nu + 1) * cols * 3), uv = new Float32Array((nu + 1) * cols * 2), col = new Float32Array((nu + 1) * cols * 3), sway = new Float32Array((nu + 1) * cols);
+  for (let i = 0; i <= nu; i++) for (let j = 0; j < cols; j++) {
+    const v = -1 + 2 * j / nv;
+    const t = (i / nu) * (1 - notch * (1 - Math.abs(v)));           // the centre ends earlier than the edges -> V notch
+    const y = yTop - len * t, h = y - NECK_Y;
+    const w = bw * (0.5 + 0.5 * smooth(0, 0.25, t));
+    const x0 = 0.2 + 0.42 * smooth(0, 0.8, t) + 0.04 * Math.sin(4 * t);   // tails start side by side and fan out a little
+    const rBase = outerSurfaceR(Math.PI / 2 - dir * Math.asin(Math.min(0.9, x0 / 1.0)), h) + FAR_GAP;
+    const edgeW = 0.015 * w * smooth(0.6, 1, Math.abs(v)) * Math.sign(v) * Math.sin(t * 19 + (dir > 0 ? 0 : 2.3));      // the free edges wave by 3% of the width
+    const ang = dir * Math.asin(Math.min(0.95, x0 / rBase)) + (v * (w / 2) + edgeW) / rBase;       // angle from +z toward +x
+    const av = Math.abs(v);
+    // surface relief, all outward (>= 0): a shallow cup (8% of the width), a slow wave (4%), a little fine crinkle, and the two edges curling up (4%)
+    const relief = w * (0.08 * v * v + 0.01 * (1 + Math.sin(t * 11 + 1.3 + dir)) + 0.006 * (1 + Math.sin(t * 31 + 2 * dir)) * (0.4 + 0.6 * av) + 0.02 * smooth(0.7, 1, av) ** 2);
+    const r = outerSurfaceR(Math.PI / 2 - ang, h) + FAR_GAP + relief;
+    const q = i * cols + j;
+    pos[q * 3] = r * Math.sin(ang); pos[q * 3 + 1] = y; pos[q * 3 + 2] = r * Math.cos(ang);
+    uv[q * 2] = t * 1.9 / 1.6; uv[q * 2 + 1] = (v + 1) / 2;
+    col[q * 3] = col[q * 3 + 1] = col[q * 3 + 2] = 1 / BODY_TONE;
+    sway[q] = t;
+  }
+  return finishGrid(pos, uv, col, sway, nu + 1, cols, false);
+}
+
+const ribbonTex = makeRibbonTexture();
+const weaveNormal = makeThreadNormal(50, 0, 16);           // satin: ~50 fine threads across the width
+const gauzeNormal = makeThreadNormal(110, 2, 256);         // gauze: finer lengthwise grain with a few glints
+const knotNormal = makeKnotNormal();
+for (const t of [weaveNormal, gauzeNormal, knotNormal]) {  // mipmaps + the maximum anisotropic filtering: no moire from a distance
+  t.generateMipmaps = true; t.minFilter = THREE.LinearMipmapLinearFilter; t.magFilter = THREE.LinearFilter;
+  t.anisotropy = renderer.capabilities.getMaxAnisotropy();
+}
+
+// studio environment for the ribbon only: a dark grey room with one long softbox above and one upright softbox on each side.
+// Assigned as material.envMap on the ribbon materials; scene.environment (roses, paper, tulle) is untouched.
+const studioEnv = (() => {
+  const room = new THREE.Scene();
+  room.add(new THREE.Mesh(new THREE.BoxGeometry(16, 16, 16), new THREE.MeshBasicMaterial({ color: 0x202023, side: THREE.BackSide })));
+  const box = (w, h, pos, rotY, rotX) => {
+    const m = new THREE.Mesh(new THREE.PlaneGeometry(w, h), new THREE.MeshBasicMaterial({ color: new THREE.Color(1, 1, 1).multiplyScalar(7), side: THREE.DoubleSide }));
+    m.position.set(...pos); m.rotation.set(rotX, rotY, 0); room.add(m);
+  };
+  box(9, 1.6, [0, 6, 0], 0, Math.PI / 2);          // top, horizontal
+  box(1.4, 7, [-6, 0, 0], Math.PI / 2, 0);         // left, upright
+  box(1.4, 7, [6, 0, 0], Math.PI / 2, 0);          // right, upright
+  const tex = pmrem.fromScene(room, 0.02).texture;
+  room.traverse(o => { if (o.isMesh) { o.geometry.dispose(); o.material.dispose(); } });
+  return tex;
+})();
+const hemMask = makeHemMask();
+function mkRibbonMat() {
+  const m = new THREE.MeshPhysicalMaterial({
+    color: '#f5efe0', roughness: 0.3, metalness: 0, sheen: 1, sheenRoughness: 0.35, sheenColor: new THREE.Color('#ffffff'),
+    specularIntensity: 0.85, clearcoat: 0,
+    anisotropy: 0.8, anisotropyRotation: 0,                  // uv u runs along the ribbon, so rotation 0 stretches the highlight along the length
+    envMap: studioEnv, envMapIntensity: 1.3,
+    normalMap: weaveNormal, normalScale: new THREE.Vector2(0.2, 0.2),
+    side: THREE.DoubleSide, map: ribbonTex, vertexColors: true, depthWrite: true,
+  });
+  // breeze: only the tails move, bending about the knot (sway = 0 at the knot, 1 at the free end). The motion points away from the paper
+  // or along it, never into it; loops, knot and band have sway = 0 and are not touched at all, so no seam can open.
+  m.onBeforeCompile = (shader) => {
+    shader.uniforms.uTime = timeU;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nattribute float sway;\nuniform float uTime;')
+      .replace('#include <begin_vertex>', `#include <begin_vertex>
+        float sw = sway * sway;
+        vec2 rad = normalize(position.xz + vec2(1e-5));
+        vec2 tng = vec2(rad.y, -rad.x);
+        transformed.xz += rad * (0.08 + 0.08 * sin(uTime * 1.4 + sway * 2.5)) * sw + tng * 0.10 * sin(uTime * 1.1 + sway * 3.0) * sw;`);
+    // sheer ribbon: the alpha map is a hem mask (white = the 3% border), which is made at least 95% opaque
+    shader.fragmentShader = shader.fragmentShader.replace('#include <alphamap_fragment>', `
+      #ifdef USE_ALPHAMAP
+        diffuseColor.a = mix(diffuseColor.a, max(diffuseColor.a, 0.95), texture2D(alphaMap, vAlphaMapUv).g);
+      #endif`);
+  };
+  return m;
+}
+const ribbonMats = { band: mkRibbonMat(), loops: mkRibbonMat(), knot: mkRibbonMat(), tails: mkRibbonMat() };
+const ribbonAll = Object.values(ribbonMats);
+
+{
+  // ONE bow, placed at the narrowest part of the paper (the neck)
+  const loopH = 1.22 * BOW_SIZE;                                    // peak-to-peak height of a loop
+  const bw = RIBBON_WIDTH_RATIO * loopH;                            // ribbon width = half the loop height
+  const Wl = 1.65 * BOW_SIZE, Hl = 0.8 * BOW_SIZE;                  // loop reach / height: the bow is ~1.45x the width of the neck
+  let zSurf = 0;                                                     // outermost paper z in front of the neck
+  for (let a = Math.PI / 2 - 0.7; a <= Math.PI / 2 + 0.7; a += 0.05) zSurf = Math.max(zSurf, outerSurfaceR(a, 0) * Math.sin(a));
+  const zO = zSurf + FAR_GAP;                                        // the plane the loops live in: 5 mm clear of the paper
+
+  const mk = (geo, mat, order) => {
+    const m = new THREE.Mesh(geo, mat);
+    m.renderOrder = order;                                           // band < paper (0) < loops < knot < tails
+    m.castShadow = true;
+    m.receiveShadow = true;
+    bouquet.add(m);
+    return m;
+  };
+
+  // narrow band: a third of the loop width, hugging the neck
+  mk(bandGeometry(bw / 3), ribbonMats.band, -1);
+
+  // two closed teardrop loops. Both ends are the same point (the centre of the knot), welded; near the root the width narrows to 50%
+  // and the band twists a little (a gathered bow); only outward offsets from the plane (z >= zO).
+  const loopPts = [];
+  for (const dir of [-1, 1]) {
+    const N = 72, pts = [];
+    const widthFn = (t) => bw * (0.5 + 0.5 * smooth(0.12, 0.3, Math.min(t, 1 - t)));
+    const tilt = -0.2 * dir, c = Math.cos(tilt), s = Math.sin(tilt);
+    for (let i = 0; i <= N; i++) {
+      const f = i / N * Math.PI * 2, e = (1 - Math.cos(f)) / 2;     // e: 0 at the roots, 1 at the tip
+      const x = dir * Wl * e, y = Hl * Math.sin(f) * (0.45 + 0.55 * e);
+      pts.push(new THREE.Vector3(x * c - y * s, NECK_Y + x * s + y * c, zO + 0.03 + widthFn(i / N) / 2 + 0.3 * e * e));   // tips lean outward; the band's half width keeps its back edge in front of the plane
+    }
+    pts[N].copy(pts[0]);                                             // closed
+    const side0 = new THREE.Vector3(0, 0, 1);                        // hoop: the width runs along z; the frame is parallel-transported round the loop
+    const fr = ribbonFramesPT(pts, side0, side0);
+    const twist = (t) => dir * (0.65 + 0.5 * (1 - smooth(0, 0.2, Math.min(t, 1 - t))));   // the band is turned ~40 deg so its face shows, and gathers near the knot
+    const ph = dir > 0 ? 0.4 : 2.7;                                   // every loop has its own phase
+    // cup 8% of the width, slow wave 2% (4 periods round the loop = wavelength ~2 widths), fine crinkle 1.5%, edges curl up 2%
+    const ripple = (t, v) => { const a = Math.abs(v); return bw * (0.08 * v * v + 0.02 * Math.sin(t * Math.PI * 8 + ph) + 0.015 * Math.sin(t * Math.PI * 22 + 2 * ph) * (0.4 + 0.6 * a) + 0.02 * smooth(0.7, 1, a) ** 2); };
+    const edge = (t, v) => 0.015 * smooth(0.6, 1, Math.abs(v)) * Math.sign(v) * Math.sin(t * Math.PI * 12 + ph + (v > 0 ? 0 : 1.9));   // free edges wave by 1.5% of the width
+    loopPts.push(ribbonSurface(pts, fr, widthFn, twist, ripple, 16, true, () => 0, edge));
+  }
+  const loopsGeo = mergeGeometries(loopPts, false);
+  loopPts.forEach(g => g.dispose());
+  mk(loopsGeo, ribbonMats.loops, 1);
+
+  // the knot: wider than the ribbon (2 x ribbon width, so the roots go in at least one ribbon width), tall enough to cover the tail tops
+  const ky = 0.7 * bw;
+  mk(knotGeometry(2.0 * bw, zSurf + 0.03, zO + 0.03 + bw * 0.9, ky, bw), ribbonMats.knot, 2);
+
+  // two tails: the tops are hidden in the knot (one ribbon width above its lower edge), at most 70% of the paper tail long
+  const yTop = NECK_Y - ky + bw;
+  const len = yTop - (NECK_Y - 0.7 * TAIL_LEN);
+  const tails = [-1, 1].map(d => tailGeometry(d, bw, yTop, len));
+  const tailsGeo = mergeGeometries(tails, false);
+  tails.forEach(g => g.dispose());
+  mk(tailsGeo, ribbonMats.tails, 3);
+}
+
+/* ---------- leaf ring on the OUTER edge of the paper mouth (eucalyptus + broad leaves), hanging over the rolled edge ---------- */
+function broadLeafGeometry() {
+  const nu = 8, nv = 4, pos = [], idx = [], uv = [];
+  for (let k = 0; k <= nu; k++) {
+    const s = k / nu, w = 0.34 * Math.sin(Math.PI * Math.pow(s, 0.75));
+    for (let j = 0; j <= nv; j++) {
+      const a = -1 + 2 * j / nv;
+      pos.push(s, a * w, Math.abs(a) * w * 0.55 + s * s * 0.18);   // V-fold along the midrib + droop
+      uv.push(j / nv, s);
+    }
+  }
+  for (let k = 0; k < nu; k++) for (let j = 0; j < nv; j++) {
+    const a = k * (nv + 1) + j, b = a + nv + 1;
+    idx.push(a, b, b + 1, a, b + 1, a + 1);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+  g.setAttribute('uv', new THREE.Float32BufferAttribute(uv, 2));
+  g.setIndex(idx);
+  g.computeVertexNormals();
+  return g;
+}
+function cupLeafGeometry() {
+  const g = new THREE.CircleGeometry(1, 16);
+  const p = g.attributes.position;
+  for (let i = 0; i < p.count; i++) p.setZ(i, 0.35 * (p.getX(i) ** 2 + p.getY(i) ** 2));
+  g.computeVertexNormals();
+  return g;
+}
+{
+  const broad = [], round = [];
+  const addLeaf = (list, base, dir, size) => {
+    const ex = dir.clone().normalize();
+    const side = new THREE.Vector3().crossVectors(ex, UP);
+    if (side.lengthSq() < 0.01) side.set(1, 0, 0);
+    side.normalize();
+    const ez = new THREE.Vector3().crossVectors(ex, side).normalize();
+    list.push({ base, ex, ey: side, ez, size });
+  };
+  // the leaves sit just outside the rolled rim of the tallest (middle) paper and hang down over its outer side; none on the printed back
+  for (let i = 0; i < 400 && broad.length < 44; i++) {
+    const th = rnd(0, Math.PI * 2);
+    if (Math.abs(wrapAngle(th - THETA_BACK)) < 1.1) continue;
+    const hr = rimH(th, 1.2) + HEIGHT_MID - 0.1;
+    const R = trumpetR(hr + 0.1) + 0.16;
+    const base = new THREE.Vector3(Math.cos(th) * R, NECK_Y + hr, Math.sin(th) * R);
+    const dir = new THREE.Vector3(Math.cos(th) * 0.55, -0.8, Math.sin(th) * 0.55).normalize().applyAxisAngle(UP, rnd(-0.4, 0.4));
+    addLeaf(broad, base, dir, rnd(0.45, 0.75));
+    for (let k = 0; k < 2; k++) {
+      const b2 = base.clone().add(new THREE.Vector3(-Math.sin(th), 0, Math.cos(th)).multiplyScalar(rnd(-0.35, 0.35))).add(new THREE.Vector3(0, rnd(0.0, 0.12), 0));
+      addLeaf(round, b2, dir.clone().applyAxisAngle(UP, rnd(-0.5, 0.5)), rnd(0.22, 0.34));
+    }
+  }
+  const col = new THREE.Color();
+  const make = (geo, list, mat, hsl, centered) => {
+    const im = new THREE.InstancedMesh(geo, mat, list.length);
+    const m4 = new THREE.Matrix4();
+    list.forEach((l, i) => {
+      m4.makeBasis(l.ex.clone().multiplyScalar(l.size), l.ey.clone().multiplyScalar(l.size), l.ez.clone().multiplyScalar(l.size));
+      m4.setPosition(centered ? l.base.clone().addScaledVector(l.ex, l.size * 0.95) : l.base);
+      im.setMatrixAt(i, m4);
+      im.setColorAt(i, col.setHSL(rnd(hsl[0], hsl[1]), rnd(hsl[2], hsl[3]), rnd(hsl[4], hsl[5])));
+    });
+    im.castShadow = false;
+    bouquet.add(im);
+  };
+  make(broadLeafGeometry(), broad, new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.55, side: THREE.DoubleSide }),
+    [0.29, 0.36, 0.25, 0.4, 0.22, 0.34], false);
+  make(cupLeafGeometry(), round, new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.6, side: THREE.DoubleSide }),
+    [0.33, 0.4, 0.12, 0.22, 0.55, 0.68], true);
+}
+
+/* ---------- wrap styles + 0.35 s fade ---------- */
+const WRAP_FOR = { '粉橘': '奶油牛皮', '象牙杏': '奶油牛皮', '正紅': '霧黑', '粉藍': '粉荷葉', '黑': '銀灰紫' };
+const wrapButtons = {};
+let userPickedWrap = false;
+
+const wrapKeysC = ['inner', 'mid', 'midPlain', 'outer', 'tulle', 'ribbon'];
+const wrapKeysN = ['outerOp', 'tulleOp', 'ribbonOp', 'ruffle', 'ribbonRough', 'ribbonSheen', 'ribbonSpec', 'sheer', 'ribbonMetal'];
+const mkWrap = () => { const o = { outerOp: 1, tulleOp: 0.45, ribbonOp: 1, ruffle: 0, ribbonRough: 0.3, ribbonSheen: 1, ribbonSpec: 0.85, sheer: 0, ribbonMetal: 0 }; wrapKeysC.forEach(k => o[k] = new THREE.Color()); return o; };
+const wrapCur = mkWrap(), wrapFrom = mkWrap(), wrapTo = mkWrap();
+const wrapFade = { active: false, t0: 0 };
+const copyWrap = (a, b) => { wrapKeysC.forEach(k => a[k].copy(b[k])); wrapKeysN.forEach(k => a[k] = b[k]); };
+
+function wrapTarget(st, out) {
+  const comp = 1 / Math.pow(st.bg / 255, 2.2);                           // compensates the print texture's base level
+  const printed = st.text || st.border;
+  out.inner.set(st.inner);
+  out.mid.set(st.mid); if (printed) out.mid.multiplyScalar(comp);
+  out.midPlain.set(st.mid); if (st.border) out.midPlain.multiplyScalar(comp);
+  out.outer.set(st.outer); out.tulle.set(st.tulle); out.ribbon.set(st.ribbon);
+  out.outerOp = st.outerOp; out.tulleOp = st.tulleOp; out.ribbonOp = st.ribbonOp; out.ruffle = st.ruffle;
+  out.ribbonRough = st.ribbonRough; out.ribbonSheen = st.ribbonSheen; out.ribbonSpec = st.ribbonSpec; out.sheer = st.sheer || 0; out.ribbonMetal = st.ribbonMetal || 0;
+}
+function setTransparent(mat, op) {
+  const tr = op < 0.999;
+  if (mat.transparent !== tr) { mat.transparent = tr; mat.depthWrite = !tr; mat.needsUpdate = true; }
+  mat.opacity = op;
+}
+const WHITE = new THREE.Color('#ffffff'), tmpSheen = new THREE.Color();
+function applyWrap(v) {
+  layerMats.inner.color.copy(v.inner);
+  layerMats.midPrint.color.copy(v.mid);
+  layerMats.midPlain.color.copy(v.midPlain);
+  layerMats.outer.color.copy(v.outer);
+  setTransparent(layerMats.outer, v.outerOp);
+  tulleMat.color.copy(v.tulle); tulleMat.opacity = v.tulleOp;
+  // sheen colour = a lighter version of the base colour; the sheer (gauze) style gives loops and tails a whiter, softer finish,
+  // while the knot and the band stay satin in every style
+  const sheenSat = tmpSheen.copy(v.ribbon).lerp(WHITE, lerp(0.45, 0.65, Math.min(1, v.ribbonMetal / 0.2))), sh = v.sheer;   // the gold ribbon gets a slightly lighter sheen
+  for (const m of ribbonAll) {
+    const sheerPart = m === ribbonMats.loops || m === ribbonMats.tails, k = sheerPart ? 0 : sh;     // k: how far this part is pulled back to satin
+    m.color.copy(v.ribbon); m.metalness = v.ribbonMetal;
+    m.roughness = lerp(v.ribbonRough, 0.3, k); m.sheen = lerp(v.ribbonSheen, 1, k); m.specularIntensity = lerp(v.ribbonSpec, 0.85, k);
+    m.sheenColor.copy(sheenSat).lerp(WHITE, sheerPart ? sh * 0.7 : 0);
+    m.anisotropy = sheerPart ? lerp(0.8, 0.12, sh) : 0.8;
+    const nm = m === ribbonMats.knot ? knotNormal : sheerPart && sh > 0.5 ? gauzeNormal : weaveNormal;
+    const ns = sheerPart ? lerp(0.2, 0.35, sh) : 0.2;
+    m.normalScale.set(ns, ns);
+    const am = sheerPart && v.ribbonOp < 0.999 ? hemMask : null;
+    if (m.normalMap !== nm || m.alphaMap !== am) { m.normalMap = nm; m.alphaMap = am; m.needsUpdate = true; }
+  }
+  // only the loops and tails are see-through (gauze ribbon); band and knot stay opaque. depthWrite stays on for all.
+  for (const m of [ribbonMats.loops, ribbonMats.tails]) {
+    const tr = v.ribbonOp < 0.999;
+    if (m.transparent !== tr) { m.transparent = tr; m.needsUpdate = true; }
+    m.opacity = v.ribbonOp;
+  }
+  ruffleU.value = v.ruffle;
+}
+function setWrapStyle(name, instant) {
+  const st = WRAP_STYLES[name];
+  const tex = getPrintTexture(st);
+  const mp = (st.text || st.border) ? tex : null, mq = st.border ? tex : null;     // prints swap at the start; colours fade
+  if (layerMats.midPrint.map !== mp) { layerMats.midPrint.map = mp; layerMats.midPrint.needsUpdate = true; }
+  if (layerMats.midPlain.map !== mq) { layerMats.midPlain.map = mq; layerMats.midPlain.needsUpdate = true; }
+  copyWrap(wrapFrom, wrapCur);
+  wrapTarget(st, wrapTo);
+  if (instant) { copyWrap(wrapCur, wrapTo); applyWrap(wrapCur); wrapFade.active = false; }
+  else { wrapFade.t0 = performance.now(); wrapFade.active = true; }
+  for (const k in wrapButtons) wrapButtons[k].classList.toggle('active', k === name);
+}
+function stepWrap(now) {
+  if (!wrapFade.active) return;
+  const k = Math.min(1, (now - wrapFade.t0) / FADE_MS);
+  const e = easeInOut(k);
+  wrapKeysC.forEach(c => wrapCur[c].copy(wrapFrom[c]).lerp(wrapTo[c], e));
+  wrapKeysN.forEach(n => wrapCur[n] = lerp(wrapFrom[n], wrapTo[n], e));
+  applyWrap(wrapCur);
+  if (k >= 1) wrapFade.active = false;
+}
+
+/* ---------- gentle wind: the whole bouquet sways about the grip ---------- */
+const swayEuler = new THREE.Euler();
+function updateSway(t) {
+  swayEuler.set(Math.sin(t * 0.53 + 1) * 0.010, 0, Math.sin(t * 0.71) * 0.014);
+  bouquet.rotation.copy(swayEuler);
+  bouquet.position.copy(GRIP).sub(GRIP.clone().applyEuler(swayEuler));
+}
+
+/* ============ LOD: nearest roses keep full detail ============ */
+const tmpV = new THREE.Vector3();
+function updateLOD() {
+  const ranked = roses.map(r => ({ r, d: tmpV.copy(r.origin).distanceTo(camera.position) })).sort((a, b) => a.d - b.d);
+  const nMid = Math.ceil(Math.max(0, roses.length - HIGH_ROSES) * 0.45);
+  ranked.forEach((o, i) => o.r.setLevel(i < HIGH_ROSES ? 0 : i < HIGH_ROSES + nMid ? 1 : 2));
+}
+
+/* ============ colour buttons ============ */
+// ONE fade drives everything: rose vertex colours (GPU mix), sheen/roughness/env and baby's breath
+const fade = { active: false, t0: 0 };
+const fadeCol = new THREE.Color(), instCol = new THREE.Color(), flowerFrom = new THREE.Color(), flowerTo = new THREE.Color();
+const sheenFrom = new THREE.Color(), sheenTo = new THREE.Color();
+let roughFrom = 0.55, roughTo = 0.55, envFrom = ENV_INTENSITY, envTo = ENV_INTENSITY, firstPalette = true;
+
+function applyFlowerColor(c) {
+  for (let i = 0; i < flowerJitter.length; i++) {
+    flowerMesh.setColorAt(i, instCol.setRGB(c.r * flowerJitter[i], c.g * flowerJitter[i], c.b * flowerJitter[i]));
+  }
+  flowerMesh.instanceColor.needsUpdate = true;
+}
+const easeInOut = (k) => k < 0.5 ? 4 * k * k * k : 1 - Math.pow(-2 * k + 2, 3) / 2;
+
+// one progress value e for every colour that changes; called from the render loop every frame
+function stepFade(now) {
+  if (!fade.active) return;
+  const k = Math.min(1, (now - fade.t0) / FADE_MS);
+  const e = easeInOut(k);
+  mixUniform.value = e;
+  petalMaterial.sheenColor.copy(sheenFrom).lerp(sheenTo, e);
+  petalMaterial.roughness = lerp(roughFrom, roughTo, e);
+  petalMaterial.envMapIntensity = lerp(envFrom, envTo, e);
+  fadeCol.copy(flowerFrom).lerp(flowerTo, e);
+  applyFlowerColor(fadeCol);
+  if (k >= 1) fade.active = false;
+}
+
+const bar = document.getElementById('colors');
+const buttons = {};
+function setPalette(name) {
+  currentPal = PALETTES[name];
+  const first = firstPalette;
+  firstPalette = false;
+  if (!userPickedWrap) setWrapStyle(WRAP_FOR[name], first);   // pair a wrap with the flower colour until the user picks one
+  // restart from whatever is on screen right now (also when clicked mid-fade): no flash
+  roses.forEach(r => r.retarget(mixUniform.value, first));
+  sheenFrom.copy(petalMaterial.sheenColor); sheenTo.set(currentPal.sheen);
+  roughFrom = petalMaterial.roughness; roughTo = currentPal.roughness ?? 0.55;
+  envFrom = petalMaterial.envMapIntensity; envTo = currentPal.env ?? ENV_INTENSITY;
+  flowerFrom.copy(first ? fadeCol.set(currentPal.breath) : fadeCol);
+  flowerTo.set(currentPal.breath);
+  if (first) {
+    mixUniform.value = 1;
+    petalMaterial.sheenColor.copy(sheenTo); petalMaterial.roughness = roughTo; petalMaterial.envMapIntensity = envTo;
+    fadeCol.copy(flowerTo); applyFlowerColor(fadeCol);
+    fade.active = false;
+  } else {
+    mixUniform.value = 0;
+    fade.t0 = performance.now();
+    fade.active = true;
+  }
+  for (const k in buttons) buttons[k].classList.toggle('active', k === name);
+}
+for (const name in PALETTES) {
+  const b = document.createElement('button');
+  b.textContent = name;
+  b.onclick = () => setPalette(name);
+  bar.appendChild(b);
+  buttons[name] = b;
+}
+const sep = document.createElement('span');
+sep.style.width = '12px';
+bar.appendChild(sep);
+for (const name in WRAP_STYLES) {
+  const b = document.createElement('button');
+  b.textContent = name;
+  b.onclick = () => { userPickedWrap = true; setWrapStyle(name, false); };
+  bar.appendChild(b);
+  wrapButtons[name] = b;
+}
+setPalette('粉橘');
+updateLOD();
+
+/* ============ loop + FPS ============ */
+const hud = document.getElementById('hud');
+if (new URLSearchParams(location.search).get('debug') === '1') hud.style.display = 'block';
+addEventListener('resize', () => {
+  camera.aspect = innerWidth / innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+});
+let frames = 0, last = performance.now(), tick = 0;
+renderer.setAnimationLoop(() => {
+  controls.update();
+  const now = performance.now();
+  timeU.value = now / 1000;
+  stepFade(now);
+  stepWrap(now);
+  updateSway(now / 1000);
+  if (++tick % 8 === 0) updateLOD();
+  renderer.render(scene, camera);
+  frames++;
+  if (now - last >= 1000) {
+    hud.textContent = `FPS ${Math.round(frames * 1000 / (now - last))}\n玫瑰 ${roses.length} 朵 · 三角形 ${renderer.info.render.triangles.toLocaleString()}\nDraw calls ${renderer.info.render.calls}`;
+    frames = 0; last = now;
+  }
+});
+</script>
+</body>
+</html>
