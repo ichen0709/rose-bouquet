@@ -74,11 +74,11 @@ const GAP = 0.005;          // 相鄰花瓣間的微小間隙
 const KEY_INTENSITY = 1.75; // 主光強度
 const ENV_INTENSITY = 1.3;  // RoomEnvironment 環境光強度
 const TRANSMISSION = 0;     // 花瓣透光（0 = 關閉；設 0.1 左右會好看但明顯變慢）
-const BABYS_BREATH_SPRIGS = LITE ? 45 : 90;  // 滿天星枝數（全部從花莖束長出，只分布在花朵之間與周圍）
+const BABYS_BREATH_SPRIGS = LITE ? 42 : 90;  // 滿天星枝數（全部從花莖束長出，只分布在花朵之間與周圍）
 const FADE_MS = 350;             // 換色漸變時間（玫瑰與滿天星共用同一個進度）
 const EUCALYPTUS_STEMS = 16;     // 尤加利葉莖數
 const EDGE_BUDS = 5;             // 最下排額外的含苞小玫瑰朵數（4~6），從紙口邊緣探出
-const SIDE_SPRIGS = LITE ? 15 : 30;          // 沿紙口邊緣向外上方延伸的滿天星枝數
+const SIDE_SPRIGS = LITE ? 14 : 30;          // 沿紙口邊緣向外上方延伸的滿天星枝數
 const PAPER_TEXT = 'You are my LOVE';   // 中層白紙上印的字
 const RIBBON_TEXT = 'Happy everyday';   // 緞帶上的淡字
 const PAPER_CREASE = 0.7;        // 皺褶強度（0 = 平滑，1 = 較皺；褶紋由頸部放射狀匯聚）
@@ -1586,48 +1586,311 @@ function cupLeafGeometry() {
   g.computeVertexNormals();
   return g;
 }
+let applyRimLayout = () => {};          // swaps the rim leaves + stems to the layout that fits the current style's paper (set below)
 {
   const broad = [], round = [];
-  const addLeaf = (list, base, dir, size) => {
-    const ex = dir.clone().normalize();
-    const side = new THREE.Vector3().crossVectors(ex, UP);
+  const blankStat = () => ({ leaves: 0, raised: 0, flipped: 0, shrunk: 0, removedLeaves: [], maxLift: 0, groups: 0, stems: 0, stemFull: 0, stemShortened: 0, trunkRemoved: 0, twigRemoved: 0, afterBad: 0, polys: [], leafPolys: [] });
+  const rimStat = fitStats.rim = { layouts: [blankStat(), blankStat()] };      // layout 0: plain paper mouth (3 styles), layout 1: the frilled mouth (粉荷葉)
+
+  // ---- the real paper: each sheet's own vertices, optionally with the style's frill (ruf * k, k = 1 for 粉荷葉) and both skins
+  const ROWS_N = ROWS_TAIL + ROWS_BODY + 1, COLS_N = COLS + 1, MSH = ROWS_N * COLS_N, TOP_ROWS = LITE ? 12 : 16, R_BELOW = ROWS_N - TOP_ROWS;
+  const sheetInfo = [];
+  bouquet.children.forEach(o => {
+    if (o.userData.cat !== 'paper') return;
+    const P = o.geometry.attributes.position.array, F = o.geometry.attributes.ruf.array, ref = ROWS_TAIL + Math.floor(ROWS_BODY * 0.7);
+    const azAt = (c) => Math.atan2(P[(ref * COLS_N + c) * 3 + 2], P[(ref * COLS_N + c) * 3]);
+    sheetInfo.push({ P, F, layer: o.material === layerMats.inner ? 'inner' : o.material === layerMats.outer ? 'outer' : 'mid', c0: azAt(COLS >> 1), hw: Math.abs(wrapAngle(azAt(COLS) - azAt(0))) / 2 });
+  });
+  const vtx = (sh, r, c, skin, k) => {
+    const q = (r * COLS_N + c + skin * MSH) * 3;
+    const x = sh.P[q] + k * sh.F[q], y = sh.P[q + 1] + k * sh.F[q + 1], z = sh.P[q + 2] + k * sh.F[q + 2];
+    return [Math.hypot(x, z), y - NECK_Y];
+  };
+  const v3 = (sh, r, c, skin, k) => { const q = (r * COLS_N + c + skin * MSH) * 3; return [sh.P[q] + k * sh.F[q], sh.P[q + 1] + k * sh.F[q + 1], sh.P[q + 2] + k * sh.F[q + 2]]; };
+  const colAt = (sh, th) => {                                                   // the two columns that bracket azimuth th (the mesh is linear between them)
+    const u = wrapAngle(th - sh.c0) / (2 * sh.hw) + 0.5;
+    if (u < -0.01 || u > 1.01) return null;
+    const f = Math.min(COLS, Math.max(0, u * COLS));
+    let c = Math.floor(f); if (c >= COLS) c = COLS - 1;
+    return { c, w: f - c };
+  };
+  const vAt = (sh, r, ca, skin, k) => { const a = vtx(sh, r, ca.c, skin, k), b = vtx(sh, r, ca.c + 1, skin, k); return [lerp(a[0], b[0], ca.w), lerp(a[1], b[1], ca.w)]; };
+  const rowFor = (sh, c, h) => { let lo = 0, hi = R_BELOW; while (hi - lo > 1) { const m = (lo + hi) >> 1; if (vtx(sh, m, c, 0, 0)[1] <= h) lo = m; else hi = m; } return lo; };
+  const segDist = (r, h, a, b) => {
+    const dx = b[0] - a[0], dy = b[1] - a[1], t = Math.max(0, Math.min(1, ((r - a[0]) * dx + (h - a[1]) * dy) / (dx * dx + dy * dy || 1)));
+    return Math.hypot(r - (a[0] + t * dx), h - (a[1] + t * dy));
+  };
+  // distance from a point to the paper (every layer, both skins) in the vertical plane at its azimuth
+  const paperDist = (p, k) => {
+    const th = Math.atan2(p.z, p.x), r = Math.hypot(p.x, p.z), h = p.y - NECK_Y;
+    let best = Infinity;
+    for (const sh of sheetInfo) {
+      const ca = colAt(sh, th);
+      if (!ca) continue;
+      const rr = rowFor(sh, ca.c, h), top = rr >= R_BELOW - 1;                 // near the rolled mouth: look at all of its rows
+      const r0 = top ? R_BELOW - 3 : Math.max(0, rr - 3), r1 = top ? ROWS_N - 1 : Math.min(ROWS_N - 1, rr + 3);
+      for (let skin = 0; skin < 2; skin++) {
+        let a = vAt(sh, r0, ca, skin, k);
+        for (let q = r0 + 1; q <= r1; q++) { const b = vAt(sh, q, ca, skin, k); best = Math.min(best, segDist(r, h, a, b)); a = b; }
+      }
+    }
+    return best;
+  };
+  const rayTri = (px, py, pz, ux, uy, uz, len, A, B, C) => {
+    const e1x = B[0] - A[0], e1y = B[1] - A[1], e1z = B[2] - A[2], e2x = C[0] - A[0], e2y = C[1] - A[1], e2z = C[2] - A[2];
+    const hx = uy * e2z - uz * e2y, hy = uz * e2x - ux * e2z, hz = ux * e2y - uy * e2x, a = e1x * hx + e1y * hy + e1z * hz;
+    if (Math.abs(a) < 1e-12) return false;
+    const f = 1 / a, sx = px - A[0], sy = py - A[1], sz = pz - A[2], u = f * (sx * hx + sy * hy + sz * hz);
+    if (u < 0 || u > 1) return false;
+    const qx = sy * e1z - sz * e1y, qy = sz * e1x - sx * e1z, qz = sx * e1y - sy * e1x, v = f * (ux * qx + uy * qy + uz * qz);
+    if (v < 0 || u + v > 1) return false;
+    const t = f * (e2x * qx + e2y * qy + e2z * qz);
+    return t > 0 && t < len;
+  };
+  // does the segment p0-p1 cross the paper mesh? (only the quads near the segment are tested)
+  const segHits = (p0, p1, k) => {
+    const dx = p1.x - p0.x, dy = p1.y - p0.y, dz = p1.z - p0.z, len = Math.hypot(dx, dy, dz);
+    if (len < 1e-6) return false;
+    const ux = dx / len, uy = dy / len, uz = dz / len;
+    const ths = [Math.atan2(p0.z, p0.x), Math.atan2(p1.z, p1.x), Math.atan2((p0.z + p1.z) / 2, (p0.x + p1.x) / 2)];
+    const hLo = Math.min(p0.y, p1.y) - NECK_Y - 0.12, hHi = Math.max(p0.y, p1.y) - NECK_Y + 0.12;
+    for (const sh of sheetInfo) {
+      const cas = ths.map(t => colAt(sh, t)).filter(Boolean);
+      if (!cas.length) continue;
+      const cLo = Math.max(0, Math.min(...cas.map(x => x.c)) - 1), cHi = Math.min(COLS - 1, Math.max(...cas.map(x => x.c)) + 1);
+      let rLo = Math.max(0, rowFor(sh, cas[0].c, hLo) - 2), rHi = Math.min(ROWS_N - 2, rowFor(sh, cas[0].c, hHi) + 2);
+      if (rHi >= R_BELOW - 3) { rHi = ROWS_N - 2; rLo = Math.min(rLo, R_BELOW - 3); }          // reaches the rolled mouth: all of its rows
+      for (let skin = 0; skin < 2; skin++) for (let r = rLo; r <= rHi; r++) for (let c = cLo; c <= cHi; c++) {
+        const A = v3(sh, r, c, skin, k), B = v3(sh, r + 1, c, skin, k), C = v3(sh, r + 1, c + 1, skin, k), D = v3(sh, r, c + 1, skin, k);
+        if (rayTri(p0.x, p0.y, p0.z, ux, uy, uz, len, A, B, C) || rayTri(p0.x, p0.y, p0.z, ux, uy, uz, len, A, C, D)) return true;
+      }
+    }
+    return false;
+  };
+  const candProfiles = (th, layer, skin, k, rFrom, rTo) => {
+    const out = [];
+    for (const sh of sheetInfo) {
+      if (sh.layer !== layer) continue;
+      const ca = colAt(sh, th);
+      if (!ca) continue;
+      const pr = [];
+      for (let r = rFrom; r <= rTo; r++) pr.push(vAt(sh, r, ca, skin, k));
+      out.push(pr);
+    }
+    return out;
+  };
+
+  const addLeaf = (list, base, dir, size, grp) => {
+    const ex0 = dir.clone().normalize();
+    const side = new THREE.Vector3().crossVectors(ex0, UP);
     if (side.lengthSq() < 0.01) side.set(1, 0, 0);
     side.normalize();
-    const ez = new THREE.Vector3().crossVectors(ex, side).normalize();
-    list.push({ base, ex, ey: side, ez, size });
+    const ez0 = new THREE.Vector3().crossVectors(ex0, side).normalize();
+    // slight irregularity: tilt +-5 degrees about the leaf's base, size +-8%
+    const g = rnd(0, Math.PI * 2), axis = side.clone().multiplyScalar(Math.cos(g)).addScaledVector(ez0, Math.sin(g)).normalize(), a = rnd(-5, 5) * Math.PI / 180;
+    list.push({ base, ex: ex0.clone().applyAxisAngle(axis, a), ey: side.clone().applyAxisAngle(axis, a), ez: ez0.clone().applyAxisAngle(axis, a), size: size * rnd(0.92, 1.08),
+      orig: { ex: ex0, ey: side, ez: ez0, size }, grp });
   };
   // the leaves sit just outside the rolled rim of the tallest (middle) paper and hang down over its outer side; none on the printed back
-  for (let i = 0; i < 400 && broad.length < 44; i++) {
+  const groups = [];
+  let groupN = 0;
+  for (let i2 = 0; i2 < 400 && broad.length < 44; i2++) {
     const th = rnd(0, Math.PI * 2);
     if (Math.abs(wrapAngle(th - THETA_BACK)) < 1.1) continue;
     const hr = rimH(th, 1.2) + HEIGHT_MID - 0.1;
     const R = trumpetR(hr + 0.1) + 0.16;
     const base = new THREE.Vector3(Math.cos(th) * R, NECK_Y + hr, Math.sin(th) * R);
     const dir = new THREE.Vector3(Math.cos(th) * 0.55, -0.8, Math.sin(th) * 0.55).normalize().applyAxisAngle(UP, rnd(-0.4, 0.4));
-    addLeaf(broad, base, dir, rnd(0.45, 0.75));
+    const grp = groupN++;
+    addLeaf(broad, base, dir, rnd(0.45, 0.75), grp);
     for (let k = 0; k < 2; k++) {
       const b2 = base.clone().add(new THREE.Vector3(-Math.sin(th), 0, Math.cos(th)).multiplyScalar(rnd(-0.35, 0.35))).add(new THREE.Vector3(0, rnd(0.0, 0.12), 0));
-      addLeaf(round, b2, dir.clone().applyAxisAngle(UP, rnd(-0.5, 0.5)), rnd(0.22, 0.34));
+      addLeaf(round, b2, dir.clone().applyAxisAngle(UP, rnd(-0.5, 0.5)), rnd(0.22, 0.34), grp);
     }
+    // the trunk continues down the inside by 1-2 leaf lengths (the leaf length of the broad leaf is its size)
+    groups.push({ grp, th, tone: rnd(-1, 1), broad: broad[broad.length - 1], rounds: round.slice(-2), ext: broad[broad.length - 1].size * rnd(1, 2) });
   }
-  const col = new THREE.Color();
-  const make = (geo, list, mat, hsl, centered) => {
-    const im = new THREE.InstancedMesh(geo, mat, list.length);
-    const m4 = new THREE.Matrix4();
-    list.forEach((l, i) => {
-      m4.makeBasis(l.ex.clone().multiplyScalar(l.size), l.ey.clone().multiplyScalar(l.size), l.ez.clone().multiplyScalar(l.size));
-      m4.setPosition(centered ? l.base.clone().addScaledVector(l.ex, l.size * 0.95) : l.base);
-      im.setMatrixAt(i, m4);
-      im.setColorAt(i, col.setHSL(rnd(hsl[0], hsl[1]), rnd(hsl[2], hsl[3]), rnd(hsl[4], hsl[5])));
+
+  const leafPts = (centered, base, ex, ey, size) => {
+    const c = centered ? base.clone().addScaledVector(ex, size * 0.95) : base.clone().addScaledVector(ex, size * 0.5);
+    const out = [base];
+    if (centered) { for (const [a, g] of [[ex, 1], [ex, -1], [ey, 1], [ey, -1]]) out.push(c.clone().addScaledVector(a, g * size)); out.push(c); }
+    else { out.push(base.clone().addScaledVector(ex, size), c, c.clone().addScaledVector(ey, size * 0.3), c.clone().addScaledVector(ey, -size * 0.3)); }
+    return out;
+  };
+  // flat paper mouth: the layout as it has always been (a leaf that only fails because of its random tilt / size goes back to its plain pose)
+  const leafOk0 = (l, centered, ex, ey, size) => !leafPts(centered, l.base, ex, ey, size).some(q => paperDist(q, 0) < 0.02);
+  for (const [list, centered] of [[broad, false], [round, true]]) for (const l of list) {
+    if (leafOk0(l, centered, l.ex, l.ey, l.size)) continue;
+    l.ex = l.orig.ex; l.ey = l.orig.ey; l.ez = l.orig.ez; l.size = l.orig.size;
+  }
+
+  // ---- one layout = leaf matrices + one merged stem geometry, for a given frill amount k
+  const RAD = LITE ? 3 : 4, SEG = LITE ? 10 : 16, STEM_R = 0.015, GAP = 0.075 + PAPER_THICK;
+  const sCol = new THREE.Color(), cLeafEnd = new THREE.Color(), cDark = new THREE.Color();
+  const V = (r, h, th) => new THREE.Vector3(r * Math.cos(th), NECK_Y + h, r * Math.sin(th));
+  const curveBad = (cv, k, e) => {
+    if (!cv) return true;
+    let prev = null;
+    for (let q = 0; q <= 30; q++) { const pt = cv.getPoint(q / 30); if (paperDist(pt, k) - e < 0.04 || (prev && segHits(prev, pt, k))) return true; prev = pt; }
+    return false;
+  };
+  // tube whose radius tapers to (almost) nothing over the part past `f0` of its length, and whose colour darkens toward the tip like the shadow of the wall
+  const taperTube = (cv, f0, tone) => {
+    const geo = new THREE.TubeGeometry(cv, SEG, STEM_R, RAD, false), pos = geo.attributes.position, n = RAD + 1;
+    cLeafEnd.setHSL(0.37 + tone * 0.02, 0.15, 0.24 + tone * 0.03); cDark.setHSL(0.38, 0.1, 0.09);
+    const c = new Float32Array(pos.count * 3);
+    for (let i = 0; i <= SEG; i++) {
+      const t = i / SEG, ctr = cv.getPointAt(t), f = f0 >= 1 ? 1 : 1 - 0.96 * smooth(f0, 1, t);       // f0 = 1: no taper (the twigs)
+      sCol.copy(cLeafEnd).lerp(cDark, f0 >= 1 ? 0 : smooth(f0 * 0.8, 1, t));
+      for (let j = 0; j < n; j++) {
+        const v = i * n + j;
+        pos.setXYZ(v, ctr.x + (pos.getX(v) - ctr.x) * f, ctr.y + (pos.getY(v) - ctr.y) * f, ctr.z + (pos.getZ(v) - ctr.z) * f);
+        c[v * 3] = sCol.r; c[v * 3 + 1] = sCol.g; c[v * 3 + 2] = sCol.b;
+      }
+    }
+    geo.setAttribute('color', new THREE.BufferAttribute(c, 3));
+    return geo;
+  };
+  // trunk: leaf base -> onto the lip -> over the top -> down the inside of the wall `depth` below the apex (gap = distance of the stem's axis from the first skin)
+  const trunkCurve = (base, th, depth, gap, k) => {
+    const cands = candProfiles(th, 'mid', 0, k, R_BELOW, ROWS_N - 1);
+    if (!cands.length) return null;
+    let prof = cands[0];                                                               // follow the sheet whose top is highest here
+    for (const c of cands) if (Math.max(...c.map(q => q[1])) > Math.max(...prof.map(q => q[1]))) prof = c;
+    const n = prof.length;
+    let ia = 0;
+    for (let q = 1; q < n; q++) if (prof[q][1] > prof[ia][1]) ia = q;                 // apex of the curl
+    const Q = prof.map((q, i2) => {
+      const a = prof[Math.max(0, i2 - 1)], b = prof[Math.min(n - 1, i2 + 1)], dr = b[0] - a[0], dy = b[1] - a[1], l = Math.hypot(dr, dy) || 1;
+      return [q[0] - dy / l * gap, q[1] + dr / l * gap];
     });
+    const yEnd = prof[ia][1] - 0.17 - depth, yOld = prof[ia][1] - 0.17 - 0.15, ks = Math.min(n - 1, ia + 2);
+    const path = [];
+    let oldIx = -1;
+    for (let q = ks; q >= 0; q--) { path.push(V(Q[q][0], Q[q][1], th)); if (oldIx < 0 && Q[q][1] <= yOld) oldIx = path.length - 1; if (Q[q][1] <= yEnd) break; }
+    if (path.length < 4) return null;
+    const A = path[0], tang = path[1].clone().sub(path[0]).normalize();
+    const land = new THREE.CubicBezierCurve3(base, base.clone().add(new THREE.Vector3(0, -0.12, 0)), A.clone().addScaledVector(tang, -0.14), A);
+    const lp = land.getPoints(5), pts = [...lp, ...path.slice(1)];
+    const segLen = (a, b) => { let L = 0; for (let q = a; q < b; q++) L += pts[q].distanceTo(pts[q + 1]); return L; };
+    const total = segLen(0, pts.length - 1), before = segLen(0, Math.min(pts.length - 1, lp.length - 1 + (oldIx < 0 ? path.length - 1 : oldIx)));
+    return { cv: new THREE.CatmullRomCurve3(pts, false, 'catmullrom', 0.5), f0: total > 0 ? Math.min(0.95, before / total) : 0.5 };
+  };
+
+  const computeLayout = (k) => {
+    const st = rimStat.layouts[k];
+    // ---- leaf poses
+    const flipBy = (pose, deg) => {                                                    // swing the leaf outward about its base (axis: the tangent of the rim)
+      const th = Math.atan2(pose.base.z, pose.base.x), axis = new THREE.Vector3(-Math.sin(th), 0, Math.cos(th)), rad = new THREE.Vector3(Math.cos(th), 0, Math.sin(th));
+      const a = deg * Math.PI / 180, e1 = pose.ex.clone().applyAxisAngle(axis, a), e2 = pose.ex.clone().applyAxisAngle(axis, -a), sgn = e1.dot(rad) >= e2.dot(rad) ? 1 : -1;
+      return { ex: pose.ex.clone().applyAxisAngle(axis, sgn * a), ey: pose.ey.clone().applyAxisAngle(axis, sgn * a), ez: pose.ez.clone().applyAxisAngle(axis, sgn * a) };
+    };
+    const poseOk = (centered, b, ex, ey, size) => {                                    // base, outline, the body of the leaf: 2 mm off the paper and nowhere through it
+      const pts = leafPts(centered, b, ex, ey, size);
+      for (let q = 0; q < pts.length; q++) {
+        if (paperDist(pts[q], k) < 0.02) return false;
+        if (q > 0) for (let t = 0.12; t < 0.99; t += 0.12) if (paperDist(pts[0].clone().lerp(pts[q], t), k) < 0.02) return false;
+      }
+      for (let q = 0; q < pts.length; q++) for (let w = q + 1; w < pts.length; w++) if (segHits(pts[q], pts[w], k)) return false;
+      return true;
+    };
+    const place = (l, centered, tag) => {
+      st.leaves++;
+      const pose = { base: l.base, ex: l.ex, ey: l.ey, ez: l.ez, size: l.size, removed: false };
+      if (k === 0) { st.leafPolys.push(leafPts(centered, pose.base, pose.ex, pose.ey, pose.size)); return pose; }      // the plain mouth keeps every leaf where it is
+      const lift = (d) => l.base.clone().add(new THREE.Vector3(0, d, 0));
+      let done = false;
+      for (let d = 0; d <= 0.1 + 1e-9 && !done; d += 0.02) if (poseOk(centered, lift(d), l.ex, l.ey, l.size)) { pose.base = lift(d); done = true; if (d > 1e-9) { st.raised++; st.maxLift = Math.max(st.maxLift, d); } }
+      for (let a = 5; a <= 25 && !done; a += 5) {                                                                      // still touching at the lift cap: turn it outward
+        const f = flipBy({ base: l.base, ex: l.ex, ey: l.ey, ez: l.ez }, a);
+        if (poseOk(centered, lift(0.1), f.ex, f.ey, l.size)) { Object.assign(pose, f, { base: lift(0.1) }); done = true; st.flipped++; st.maxLift = Math.max(st.maxLift, 0.1); }
+      }
+      for (const sc of [0.95, 0.9, 0.85, 0.8]) {                                                                       // then smaller (at most 20%)
+        if (done) break;
+        const f = flipBy({ base: l.base, ex: l.ex, ey: l.ey, ez: l.ez }, 25);
+        if (poseOk(centered, lift(0.1), f.ex, f.ey, l.size * sc)) { Object.assign(pose, f, { base: lift(0.1), size: l.size * sc }); done = true; st.shrunk++; st.maxLift = Math.max(st.maxLift, 0.1); }
+      }
+      if (!done) { pose.removed = true; st.removedLeaves.push(tag); }
+      else st.leafPolys.push(leafPts(centered, pose.base, pose.ex, pose.ey, pose.size));
+      return pose;
+    };
+    const P_b = broad.map((l, ix) => place(l, false, 'broad#' + ix)), P_r = round.map((l, ix) => place(l, true, 'round#' + ix));
+    const m4 = new THREE.Matrix4(), toMats = (arr, centered) => {
+      const out = new Float32Array(arr.length * 16);
+      arr.forEach((p, ix) => {
+        const sz = p.removed ? 0 : p.size;
+        m4.makeBasis(p.ex.clone().multiplyScalar(sz), p.ey.clone().multiplyScalar(sz), p.ez.clone().multiplyScalar(sz));
+        m4.setPosition(centered ? p.base.clone().addScaledVector(p.ex, p.size * 0.95) : p.base);
+        m4.toArray(out, ix * 16);
+      });
+      return out;
+    };
+
+    // ---- stems
+    const parts = [], polys = st.polys;
+    for (const g of groups) {
+      st.groups++;
+      const bp = P_b[broad.indexOf(g.broad)];
+      if (bp.removed) { st.trunkRemoved++; continue; }
+      let res = null, mode = 'full';
+      // 1-2 leaf lengths longer than before, shortened step by step (and a little nearer the wall) until it keeps off the paper
+      outer: for (const f of [1, 0.75, 0.5, 0.25, 0]) for (const gap of [GAP, GAP - 0.02]) {
+        const t = trunkCurve(bp.base, g.th, 0.15 + g.ext * f, gap, k);
+        if (t && !curveBad(t.cv, k, STEM_R)) { res = t; if (f < 1 || gap !== GAP) mode = 'shortened'; break outer; }
+      }
+      if (!res) fb: for (let depth = 0.12; depth >= -0.3 - 1e-9; depth -= 0.03) for (const gap of [GAP, GAP - 0.03, GAP + 0.04]) { const t = trunkCurve(bp.base, g.th, depth, gap, k); if (t && !curveBad(t.cv, k, STEM_R)) { res = t; mode = 'shortened'; break fb; } }   // shorter still (down to just over the lip), nearer or farther from the wall
+      if (!res) { st.trunkRemoved++; continue; }                                         // this group stays leaf-only
+      if (mode === 'full') st.stemFull++; else st.stemShortened++;
+      parts.push(taperTube(res.cv, res.f0, g.tone)); polys.push(res.cv.getPoints(30)); st.stems++;
+      const J = res.cv.getPointAt(0.22 * res.f0);          // where the twigs join: on top of the lip, as before
+      for (const rl of g.rounds) {
+        const pr = P_r[round.indexOf(rl)];
+        if (pr.removed) continue;
+        const m = pr.base.clone().lerp(J, 0.5); m.y += 0.04;
+        const tw = new THREE.QuadraticBezierCurve3(pr.base, m, J);
+        if (curveBad(tw, k, STEM_R)) { st.twigRemoved++; continue; }
+        parts.push(taperTube(tw, 1, g.tone)); polys.push(tw.getPoints(30)); st.stems++;
+      }
+    }
+    st.afterBad = polys.filter(pl => pl.some((q, ix) => paperDist(q, k) - STEM_R < 0.04 || (ix > 0 && segHits(pl[ix - 1], q, k)))).length;
+    const geo = parts.length ? mergeGeometries(parts, false) : new THREE.BufferGeometry();
+    parts.forEach(gm => gm.dispose());
+    return { geo, broadM: toMats(P_b, false), roundM: toMats(P_r, true) };
+  };
+
+  const layouts = [computeLayout(0), null];
+  const ensureLayout1 = () => { if (!layouts[1]) layouts[1] = computeLayout(1); };
+  // the frilled-mouth layout (粉荷葉) is computed a moment after the first picture is up (or on demand if that style is picked first)
+  setTimeout(() => (window.requestIdleCallback || setTimeout)(ensureLayout1), 2500);
+
+  const stemMesh = new THREE.Mesh(layouts[0].geo, new THREE.MeshStandardMaterial({ color: '#ffffff', vertexColors: true, roughness: 0.6 }));
+  stemMesh.userData.cat = 'eucalyptus';
+  bouquet.add(stemMesh);
+
+  const col = new THREE.Color();
+  const make = (geo, list, mat, hsl, mats) => {
+    const im = new THREE.InstancedMesh(geo, mat, list.length);
+    im.instanceMatrix.array.set(mats);
+    list.forEach((l, ix) => im.setColorAt(ix, col.setHSL(rnd(hsl[0], hsl[1]), rnd(hsl[2], hsl[3]), rnd(hsl[4], hsl[5]))));
     im.castShadow = false;
     im.userData.cat = 'eucalyptus';
     bouquet.add(im);
+    return im;
   };
-  make(broadLeafGeometry(), broad, new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.55, side: THREE.DoubleSide }),
-    [0.29, 0.36, 0.25, 0.4, 0.22, 0.34], false);
-  make(cupLeafGeometry(), round, new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.6, side: THREE.DoubleSide }),
-    [0.33, 0.4, 0.12, 0.22, 0.55, 0.68], true);
+  const imBroad = make(broadLeafGeometry(), broad, new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.55, side: THREE.DoubleSide }),
+    [0.285, 0.365, 0.24, 0.41, 0.2, 0.36], layouts[0].broadM);
+  const imRound = make(cupLeafGeometry(), round, new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.6, side: THREE.DoubleSide }),
+    [0.325, 0.405, 0.11, 0.23, 0.52, 0.71], layouts[0].roundM);
+  let curLayout = 0;
+  applyRimLayout = (k) => {
+    if (k === 1) ensureLayout1();
+    if (k === curLayout || !layouts[k]) return;
+    stemMesh.geometry = layouts[k].geo;
+    imBroad.instanceMatrix.array.set(layouts[k].broadM); imBroad.instanceMatrix.needsUpdate = true;
+    imRound.instanceMatrix.array.set(layouts[k].roundM); imRound.instanceMatrix.needsUpdate = true;
+    curLayout = k;
+  };
 }
 
 await frame();
@@ -1697,7 +1960,7 @@ function setWrapStyle(name, instant) {
   if (layerMats.midPlain.map !== mq) { layerMats.midPlain.map = mq; layerMats.midPlain.needsUpdate = true; }
   copyWrap(wrapFrom, wrapCur);
   wrapTarget(st, wrapTo);
-  if (instant) { copyWrap(wrapCur, wrapTo); applyWrap(wrapCur); wrapFade.active = false; }
+  if (instant) { copyWrap(wrapCur, wrapTo); applyWrap(wrapCur); wrapFade.active = false; applyRimLayout(st.ruffle > 0.5 ? 1 : 0); }
   else { wrapFade.t0 = performance.now(); wrapFade.active = true; }
   for (const k in wrapButtons) wrapButtons[k].classList.toggle('active', k === name);
 }
@@ -1708,7 +1971,7 @@ function stepWrap(now) {
   wrapKeysC.forEach(c => wrapCur[c].copy(wrapFrom[c]).lerp(wrapTo[c], e));
   wrapKeysN.forEach(n => wrapCur[n] = lerp(wrapFrom[n], wrapTo[n], e));
   applyWrap(wrapCur);
-  if (k >= 1) wrapFade.active = false;
+  if (k >= 1) { wrapFade.active = false; applyRimLayout(wrapTo.ruffle > 0.5 ? 1 : 0); }
 }
 
 /* ---------- gentle wind: the whole bouquet sways about the grip ---------- */
