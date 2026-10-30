@@ -24,6 +24,11 @@
     position: fixed; left: 10px; top: 8px; z-index: 2; white-space: pre; pointer-events: none;
     font: 12px/1.5 ui-monospace, Consolas, monospace; color: rgba(70, 50, 45, 0.75);
   }
+  #loading {
+    position: fixed; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center;
+    font: 15px/1.4 system-ui, sans-serif; letter-spacing: 0.15em; color: rgba(70, 50, 45, 0.45);
+    background: radial-gradient(ellipse at 50% 35%, #f6f0ec 0%, #e3d9d3 60%, #cfc3bc 100%); transition: opacity 0.6s ease;
+  }
   #hint {
     position: fixed; left: 0; right: 0; bottom: 12px; text-align: center;
     font: 12px/1.4 system-ui, sans-serif; color: rgba(70, 50, 45, 0.5); pointer-events: none;
@@ -40,6 +45,7 @@
 </head>
 <body>
 <div id="hud">生成中…</div>
+<div id="loading">載入中…</div>
 <div id="colors"></div>
 <div id="hint">拖曳旋轉 · 滾輪 / 雙指縮放</div>
 <script type="module">
@@ -51,9 +57,15 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js';
 /* =====================================================================
  *  可調參數
  * ===================================================================== */
+// phones (coarse pointer, or a narrow screen) get the lite build automatically; ?quality=high / ?quality=low force either one
+const QUALITY_PARAM = new URLSearchParams(location.search).get('quality');
+const LITE = QUALITY_PARAM === 'low' || (QUALITY_PARAM !== 'high' && (matchMedia('(pointer: coarse)').matches || innerWidth <= 820));
+const T_START = performance.now();
+// let the browser paint / handle touches between heavy build steps (rAF is paused in background tabs, hence the timer fallback)
+const frame = () => new Promise(res => { let d = false; const f = () => { if (!d) { d = true; res(); } }; requestAnimationFrame(() => setTimeout(f, 0)); setTimeout(f, 80); });
 const ROSE_COUNT = 20;      // 花朵數量（建議 15~25）
-const MESH_DETAIL = 28;     // 網格細分：最近幾朵玫瑰每片花瓣的縱向分段數（橫向約 0.86 倍）；遠處自動降到 60% / 35%
-const HIGH_ROSES = 6;       // 保留高細分的玫瑰數（離鏡頭最近的幾朵）
+const MESH_DETAIL = LITE ? 14 : 28;     // 網格細分：最近幾朵玫瑰每片花瓣的縱向分段數（橫向約 0.86 倍）；遠處自動降到 60% / 35%
+const HIGH_ROSES = LITE ? 3 : 6;       // 保留高細分的玫瑰數（離鏡頭最近的幾朵）
 const SHADOW_ROSES = 6;     // 投射陰影的玫瑰數（只有中間主要幾朵）
 const PETALS = 36;          // 每朵花瓣數上限（實際 86%~100%）
 const CORE_PETALS = 4;      // 最內層緊包成花心的片數
@@ -62,11 +74,11 @@ const GAP = 0.005;          // 相鄰花瓣間的微小間隙
 const KEY_INTENSITY = 1.75; // 主光強度
 const ENV_INTENSITY = 1.3;  // RoomEnvironment 環境光強度
 const TRANSMISSION = 0;     // 花瓣透光（0 = 關閉；設 0.1 左右會好看但明顯變慢）
-const BABYS_BREATH_SPRIGS = 90;  // 滿天星枝數（全部從花莖束長出，只分布在花朵之間與周圍）
+const BABYS_BREATH_SPRIGS = LITE ? 45 : 90;  // 滿天星枝數（全部從花莖束長出，只分布在花朵之間與周圍）
 const FADE_MS = 350;             // 換色漸變時間（玫瑰與滿天星共用同一個進度）
 const EUCALYPTUS_STEMS = 16;     // 尤加利葉莖數
 const EDGE_BUDS = 5;             // 最下排額外的含苞小玫瑰朵數（4~6），從紙口邊緣探出
-const SIDE_SPRIGS = 30;          // 沿紙口邊緣向外上方延伸的滿天星枝數
+const SIDE_SPRIGS = LITE ? 15 : 30;          // 沿紙口邊緣向外上方延伸的滿天星枝數
 const PAPER_TEXT = 'You are my LOVE';   // 中層白紙上印的字
 const RIBBON_TEXT = 'Happy everyday';   // 緞帶上的淡字
 const PAPER_CREASE = 0.7;        // 皺褶強度（0 = 平滑，1 = 較皺；褶紋由頸部放射狀匯聚）
@@ -115,12 +127,12 @@ const Y_ROOT = -0.36;       // height where every petal root converges (just abo
 
 /* ============ renderer / scene ============ */
 const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
-renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, LITE ? 1.5 : 2));
 renderer.setSize(innerWidth, innerHeight);
 renderer.outputColorSpace = THREE.SRGBColorSpace;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = 1.05;
-renderer.shadowMap.enabled = true;
+renderer.shadowMap.enabled = !LITE;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 document.body.appendChild(renderer.domElement);
 
@@ -139,11 +151,17 @@ controls.maxDistance = 45;
 controls.autoRotate = true;           // slow turntable
 controls.autoRotateSpeed = 0.7;
 controls.maxPolarAngle = Math.PI * 0.8;
+let interacting = false;
+if (LITE) {
+  controls.dampingFactor = 0.14;       // settles in a few frames instead of ~40: less work after the finger lifts
+  controls.addEventListener('start', () => { interacting = true; });
+  controls.addEventListener('end', () => { interacting = false; });
+}
 
 const key = new THREE.DirectionalLight(0xfff1e6, KEY_INTENSITY);
 key.position.set(6, 10, 7);
-key.castShadow = true;
-key.shadow.mapSize.set(4096, 4096);
+key.castShadow = !LITE;
+if (!LITE) key.shadow.mapSize.set(4096, 4096);
 key.target.position.set(0, -3, 0);          // aim at the middle of the bouquet so the whole cone fits the shadow map
 scene.add(key.target);
 key.shadow.camera.left = -9.5; key.shadow.camera.right = 9.5;
@@ -163,6 +181,20 @@ floor.rotation.x = -Math.PI / 2;
 floor.position.y = -7.2;
 floor.receiveShadow = true;
 scene.add(floor);
+if (LITE) {
+  // no shadow map on phones: a soft-edged round blob under the bouquet stands in for it
+  const c = document.createElement('canvas');
+  c.width = c.height = 128;
+  const g = c.getContext('2d'), grd = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  grd.addColorStop(0, 'rgba(70,52,46,0.24)'); grd.addColorStop(0.5, 'rgba(70,52,46,0.17)'); grd.addColorStop(1, 'rgba(70,52,46,0)');
+  g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
+  floor.geometry.dispose();
+  floor.geometry = new THREE.PlaneGeometry(13, 13);
+  floor.material.dispose();
+  floor.material = new THREE.MeshBasicMaterial({ map: new THREE.CanvasTexture(c), transparent: true, depthWrite: false });
+  floor.position.set(-1.3, -7.2, -1.6);              // cast away from the key light, like the real shadow
+  floor.receiveShadow = false;
+}
 
 const bouquet = new THREE.Group();     // everything of the bouquet; swayed by the wind about the grip
 scene.add(bouquet);
@@ -486,8 +518,8 @@ const TH_MAX = 0.98;                            // dome half-angle (rad)
 const GRIP = new THREE.Vector3(0, -5.4, 0);     // every stem converges here
 const detailOf = (level) => {
   const nu = [MESH_DETAIL, Math.round(MESH_DETAIL * 0.6), Math.round(MESH_DETAIL * 0.35)][level];
-  const NU = Math.max(level === 2 ? 6 : 10, nu);
-  return [NU, Math.max(level === 2 ? 5 : 8, Math.round(NU * 0.86))];
+  const NU = Math.max(level === 2 ? 6 : LITE ? 8 : 10, nu);
+  return [NU, Math.max(level === 2 ? 5 : LITE ? 7 : 8, Math.round(NU * 0.86))];
 };
 
 class Rose {
@@ -502,6 +534,7 @@ class Rose {
     this.mesh.scale.setScalar(spec.scale);
     this.mesh.castShadow = spec.index < SHADOW_ROSES;
     this.mesh.receiveShadow = true;
+    this.mesh.userData.cat = 'rose';
     bouquet.add(this.mesh);
   }
   setLevel(l) {
@@ -511,7 +544,7 @@ class Rose {
       this.geos[l] = buildRoseGeometry(this.recipe, nu, nv);
       recolorGeometry(this.geos[l], currentPal, this.variant, true);
     }
-    if (this.level === 0 && this.geos[0]) { this.geos[0].dispose(); this.geos[0] = null; }   // free the heavy mesh when it leaves the front
+    if (!LITE && this.level === 0 && this.geos[0]) { this.geos[0].dispose(); this.geos[0] = null; }   // free the heavy mesh when it leaves the front
     this.mesh.geometry = this.geos[l];
     this.level = l;
   }
@@ -662,6 +695,7 @@ function layoutRoses() {
 }
 
 const roses = layoutRoses().map(spec => new Rose(spec));
+await frame();
 
 /* ---------- stems with thorns (one merged mesh) ---------- */
 const stemMaterial = new THREE.MeshStandardMaterial({ color: '#3b6a33', roughness: 0.6 });
@@ -691,6 +725,7 @@ const stemMaterial = new THREE.MeshStandardMaterial({ color: '#3b6a33', roughnes
   const mesh = new THREE.Mesh(mergeGeometries(parts, false), stemMaterial);
   parts.forEach(g => g.dispose());
   mesh.castShadow = true;
+  mesh.userData.cat = 'stems';
   bouquet.add(mesh);
 }
 
@@ -729,6 +764,7 @@ function fitBranch(start, end, test) {
 }
 
 /* ---------- filler: baby's breath (InstancedMesh blossoms on fine forked twigs) ---------- */
+await frame();
 let flowerMesh = null;
 const flowerJitter = [];
 const insideRose = (p, k) => roses.some(r => p.distanceTo(r.origin) < r.scale * 1.15 * k);
@@ -820,9 +856,10 @@ const insideRose = (p, k) => roses.some(r => p.distanceTo(r.origin) < r.scale * 
   for (let s = 0; s < SIDE_SPRIGS; s++) makeSprig({ thLo: 1.0, thHi: 1.2, rLo: -0.1, rHi: 0.45, cap: 1.25, radial: 0.9 });
   const twigMesh = new THREE.Mesh(mergeGeometries(twigParts, false), new THREE.MeshStandardMaterial({ color: '#6f8f5d', roughness: 0.7 }));
   twigParts.forEach(g => g.dispose());
+  twigMesh.userData.cat = 'gypsophila';
   bouquet.add(twigMesh);
 
-  const fm = new THREE.InstancedMesh(new THREE.IcosahedronGeometry(1, 1),
+  const fm = new THREE.InstancedMesh(LITE ? new THREE.SphereGeometry(1, 5, 3) : new THREE.IcosahedronGeometry(1, 1),
     new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.55, emissive: '#2a2a2e' }), flowers.length);
   const m4 = new THREE.Matrix4();
   flowers.forEach((f, i) => {
@@ -831,14 +868,16 @@ const insideRose = (p, k) => roses.some(r => p.distanceTo(r.origin) < r.scale * 
     flowerJitter[i] = 1 + rnd(-0.06, 0.06);          // each bud ±6% lighter / darker than the base colour
     fm.setColorAt(i, new THREE.Color(1, 1, 1));
   });
+  fm.userData.cat = 'gypsophila';
   bouquet.add(fm);
   flowerMesh = fm;
 }
 
 /* ---------- filler: eucalyptus (round grey-green leaves alternating along thin stems) ---------- */
+await frame();
 {
   const stems = [];
-  const leafGeo = new THREE.CircleGeometry(1, 18);
+  const leafGeo = new THREE.CircleGeometry(1, LITE ? 9 : 18);
   {
     const p = leafGeo.attributes.position;
     for (let i = 0; i < p.count; i++) p.setZ(i, 0.35 * (p.getX(i) ** 2 + p.getY(i) ** 2));   // slightly cupped
@@ -909,6 +948,7 @@ const insideRose = (p, k) => roses.some(r => p.distanceTo(r.origin) < r.scale * 
   }
   const stemMesh = new THREE.Mesh(mergeGeometries(stems, false), new THREE.MeshStandardMaterial({ color: '#7c9483', roughness: 0.6 }));
   stems.forEach(g => g.dispose());
+  stemMesh.userData.cat = 'eucalyptus';
   bouquet.add(stemMesh);
 
   const lm = new THREE.InstancedMesh(leafGeo,
@@ -916,6 +956,7 @@ const insideRose = (p, k) => roses.some(r => p.distanceTo(r.origin) < r.scale * 
   const col = new THREE.Color();
   mats.forEach((m, i) => { lm.setMatrixAt(i, m); lm.setColorAt(i, col.setHSL(rnd(0.33, 0.4), rnd(0.12, 0.22), rnd(0.55, 0.68))); });
   lm.castShadow = false;
+  lm.userData.cat = 'eucalyptus';
   bouquet.add(lm);
 }
 
@@ -926,7 +967,7 @@ const timeU = { value: 0 };       // drives the ribbon-tail breeze in the shader
 const ruffleU = { value: 0 };     // 0..1: frilled rim of the middle paper (pink style)
 
 /* ---------- one big sheet: high-density surface, rolled rim, rounded corners, Laplacian-smoothed ---------- */
-const ROWS_TAIL = 14, ROWS_BODY = 50, COLS = 48;      // 65 x 49 vertices per sheet
+const ROWS_TAIL = LITE ? 8 : 14, ROWS_BODY = LITE ? 28 : 50, COLS = LITE ? 32 : 48;      // 65 x 49 vertices per sheet
 function makeSheet(sign, center, hw, idx, o) {
   const rows = ROWS_TAIL + ROWS_BODY + 1, cols = COLS + 1, M = rows * cols;
   const P = new Float32Array(M * 3), UV = new Float32Array(M * 4), RUF = new Float32Array(M * 6);
@@ -1006,7 +1047,7 @@ function makeSheet(sign, center, hw, idx, o) {
 }
 
 /* ---------- tulle skirt: wide frilled ring gathered at the neck, reaching ~2/3 up the paper; its outer edge never exceeds the paper mouth ---------- */
-function tulleGeometry(nT = 160, nS = 48) {
+function tulleGeometry(nT = LITE ? 112 : 160, nS = LITE ? 32 : 48) {
   const cols = nT + 1, rows = nS + 1;
   const pos = new Float32Array(rows * cols * 3), uv = new Float32Array(rows * cols * 2);
   const cap = PAPER_RIM_RADIUS + RIM_GAP - 0.02;                // outer paper mouth radius
@@ -1222,14 +1263,18 @@ let tulleMesh;
     const m = new THREE.Mesh(makeSheet(d.sign, center, d.hw, k, d), mat);
     m.castShadow = true;
     m.receiveShadow = true;
+    m.userData.cat = 'paper';
     bouquet.add(m);
+    await frame();
   }
   tulleMesh = new THREE.Mesh(tulleGeometry(), tulleMat);
   tulleMesh.renderOrder = 2;
   tulleMesh.receiveShadow = true;
+  tulleMesh.userData.cat = 'tulle';
   bouquet.add(tulleMesh);
 }
 
+await frame();
 /* ---------- ribbon: zero-thickness double-sided band surfaces (no extruded bars, no end faces) ---------- */
 const BAND_GAP = 0.03;      // the narrow band sits ~1.5 mm above the paper (1 unit is about 5 cm); 1 mm let pleat peaks between mesh samples poke through
 const FAR_GAP = 0.1;        // loops and tails keep ~5 mm clear of the paper
@@ -1465,6 +1510,7 @@ const ribbonAll = Object.values(ribbonMats);
     m.renderOrder = order;                                           // band < paper (0) < loops < knot < tails
     m.castShadow = true;
     m.receiveShadow = true;
+    m.userData.cat = 'ribbon';
     bouquet.add(m);
     return m;
   };
@@ -1513,7 +1559,7 @@ const ribbonAll = Object.values(ribbonMats);
 
 /* ---------- leaf ring on the OUTER edge of the paper mouth (eucalyptus + broad leaves), hanging over the rolled edge ---------- */
 function broadLeafGeometry() {
-  const nu = 8, nv = 4, pos = [], idx = [], uv = [];
+  const nu = LITE ? 5 : 8, nv = LITE ? 2 : 4, pos = [], idx = [], uv = [];
   for (let k = 0; k <= nu; k++) {
     const s = k / nu, w = 0.34 * Math.sin(Math.PI * Math.pow(s, 0.75));
     for (let j = 0; j <= nv; j++) {
@@ -1534,7 +1580,7 @@ function broadLeafGeometry() {
   return g;
 }
 function cupLeafGeometry() {
-  const g = new THREE.CircleGeometry(1, 16);
+  const g = new THREE.CircleGeometry(1, LITE ? 8 : 16);
   const p = g.attributes.position;
   for (let i = 0; i < p.count; i++) p.setZ(i, 0.35 * (p.getX(i) ** 2 + p.getY(i) ** 2));
   g.computeVertexNormals();
@@ -1575,6 +1621,7 @@ function cupLeafGeometry() {
       im.setColorAt(i, col.setHSL(rnd(hsl[0], hsl[1]), rnd(hsl[2], hsl[3]), rnd(hsl[4], hsl[5])));
     });
     im.castShadow = false;
+    im.userData.cat = 'eucalyptus';
     bouquet.add(im);
   };
   make(broadLeafGeometry(), broad, new THREE.MeshStandardMaterial({ color: '#ffffff', roughness: 0.55, side: THREE.DoubleSide }),
@@ -1583,6 +1630,7 @@ function cupLeafGeometry() {
     [0.33, 0.4, 0.12, 0.22, 0.55, 0.68], true);
 }
 
+await frame();
 /* ---------- wrap styles + 0.35 s fade ---------- */
 const WRAP_FOR = { '粉橘': '奶油牛皮', '象牙杏': '奶油牛皮', '正紅': '霧黑', '粉藍': '粉荷葉', '黑': '銀灰紫' };
 const wrapButtons = {};
@@ -1676,7 +1724,21 @@ const tmpV = new THREE.Vector3();
 function updateLOD() {
   const ranked = roses.map(r => ({ r, d: tmpV.copy(r.origin).distanceTo(camera.position) })).sort((a, b) => a.d - b.d);
   const nMid = Math.ceil(Math.max(0, roses.length - HIGH_ROSES) * 0.45);
-  ranked.forEach((o, i) => o.r.setLevel(i < HIGH_ROSES ? 0 : i < HIGH_ROSES + nMid ? 1 : 2));
+  let builds = 0;
+  ranked.forEach((o, i) => {
+    const l = i < HIGH_ROSES ? 0 : i < HIGH_ROSES + nMid ? 1 : 2;
+    if (LITE && !o.r.geos[l] && o.r.level !== l && builds++ >= 1) return;       // phones: spread rebuilds over several updates
+    o.r.setLevel(l);
+  });
+}
+// first build: a few roses per frame so the loading screen keeps painting
+async function buildRosesBatched() {
+  const ranked = roses.map(r => ({ r, d: tmpV.copy(r.origin).distanceTo(camera.position) })).sort((a, b) => a.d - b.d);
+  const nMid = Math.ceil(Math.max(0, roses.length - HIGH_ROSES) * 0.45);
+  for (let i = 0; i < ranked.length; i++) {
+    ranked[i].r.setLevel(i < HIGH_ROSES ? 0 : i < HIGH_ROSES + nMid ? 1 : 2);
+    if (i % 2 === 1) await frame();
+  }
 }
 
 /* ============ colour buttons ============ */
@@ -1752,7 +1814,7 @@ for (const name in WRAP_STYLES) {
   wrapButtons[name] = b;
 }
 setPalette('粉橘');
-updateLOD();
+await buildRosesBatched();
 
 /* ============ loop + FPS ============ */
 const hud = document.getElementById('hud');
@@ -1763,21 +1825,29 @@ addEventListener('resize', () => {
   renderer.setSize(innerWidth, innerHeight);
 });
 let frames = 0, last = performance.now(), tick = 0;
+const loadSec = ((performance.now() - T_START) / 1000).toFixed(1);
 renderer.setAnimationLoop(() => {
   controls.update();
   const now = performance.now();
   timeU.value = now / 1000;
   stepFade(now);
   stepWrap(now);
-  updateSway(now / 1000);
-  if (++tick % 8 === 0) updateLOD();
+  tick++;
+  if (!LITE || (tick & 1) === 0) updateSway(now / 1000);
+  if (tick % 8 === 0 && !(LITE && interacting)) updateLOD();
   renderer.render(scene, camera);
   frames++;
   if (now - last >= 1000) {
-    hud.textContent = `FPS ${Math.round(frames * 1000 / (now - last))}\n玫瑰 ${roses.length} 朵 · 三角形 ${renderer.info.render.triangles.toLocaleString()}\nDraw calls ${renderer.info.render.calls}`;
+    if (hud.style.display === 'block') hud.textContent = `FPS ${Math.round(frames * 1000 / (now - last))}\n畫質 ${LITE ? '精簡版' : '完整版'} · 載入 ${loadSec} 秒\n玫瑰 ${roses.length} 朵 · 三角形 ${renderer.info.render.triangles.toLocaleString()}\nDraw calls ${renderer.info.render.calls}`;
     frames = 0; last = now;
   }
 });
+// done: fade the loading screen out
+{
+  const el = document.getElementById('loading');
+  el.style.opacity = '0';
+  setTimeout(() => el.remove(), 700);
+}
 </script>
 </body>
 </html>
